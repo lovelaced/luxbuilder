@@ -117,36 +117,30 @@ fun EditScreen(
             )
         }
 
-        // Preview. References display as-is (the LUT is *derived from* them —
-        // applying the LUT to a reference would be a recursive lie). Any
-        // other photo (e.g. one the user picked via "MY PHOTO…") gets the
-        // grading shader applied so it's a real test surface for the look.
+        // References *define* the look — viewing them at LUT-on is a recursive
+        // exaggeration, so the resting state for a reference defaults to
+        // ORIGINAL. User-picked "my photo" defaults to LUT (the whole point
+        // of seeing it is to check the look on a real test surface).
+        // The user can flip the resting state explicitly via the segmented
+        // toggle below, and A/B-drag the preview to compare either way.
         val viewingReference = state.effectivePreviewUri != null &&
             state.references.any { it.uri == state.effectivePreviewUri }
+        var showGraded by rememberSaveable(state.effectivePreviewUri) {
+            mutableStateOf(!viewingReference)
+        }
 
         Box(
             modifier = Modifier.fillMaxWidth(),
             contentAlignment = Alignment.Center,
         ) {
-            PreviewSurface(
-                bitmap = bitmap,
-                state = state,
-                applyShader = !viewingReference,
-            )
+            PreviewSurface(bitmap = bitmap, state = state, showGraded = showGraded)
         }
 
-        // Tiny caption clarifying which mode the preview is in
-        if (state.references.isNotEmpty()) {
-            Text(
-                text = if (viewingReference)
-                    "VIEWING REFERENCE · AS-IS · LUT IS DERIVED FROM THIS"
-                else
-                    "VIEWING YOUR PHOTO · LUT APPLIED",
-                style = Lux.type.labelMono,
-                color = if (viewingReference) Lux.colors.textTertiary else Lux.colors.accent.copy(alpha = 0.7f),
-                modifier = Modifier.padding(horizontal = LuxSpacing.lg, vertical = LuxSpacing.xs),
-            )
-        }
+        // Preview-mode toggle + drag hint
+        PreviewModeRow(
+            showGraded = showGraded,
+            onSelect = { showGraded = it },
+        )
 
         // Preview-source switcher
         PreviewSourceRow(state = state, store = store, onPickOwn = onPickPreviewSource)
@@ -296,6 +290,33 @@ private fun HeaderChip(label: String, enabled: Boolean, onClick: () -> Unit) {
             text = label,
             style = Lux.type.readoutLg,
             color = if (enabled) colors.textPrimary else colors.textTertiary,
+        )
+    }
+}
+
+@Composable
+private fun PreviewModeRow(showGraded: Boolean, onSelect: (Boolean) -> Unit) {
+    val colors = Lux.colors
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = LuxSpacing.lg, vertical = LuxSpacing.xs),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "PREVIEW",
+            style = Lux.type.labelMono,
+            color = colors.textTertiary,
+        )
+        Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xs))
+        ChipMini(label = "ORIGINAL", active = !showGraded, onClick = { onSelect(false) })
+        Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xxs))
+        ChipMini(label = "LUT", active = showGraded, onClick = { onSelect(true) })
+        Spacer(modifier = Modifier.weight(1f))
+        Text(
+            text = "DRAG ⇄ TO COMPARE",
+            style = Lux.type.numMicro,
+            color = colors.textTertiary,
         )
     }
 }
