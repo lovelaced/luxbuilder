@@ -8,8 +8,7 @@ import java.util.UUID
  * dispatch site.
  */
 fun reduce(state: LuxState, intent: LuxIntent): LuxState = when (intent) {
-    is LuxIntent.SetSource          -> state.copy(sourceUri = intent.uri)
-    is LuxIntent.ClearSource        -> state.copy(sourceUri = null)
+    is LuxIntent.SetPreview         -> state.copy(previewUri = intent.uri)
 
     is LuxIntent.AddCurvePoint      -> state.copy(tone = state.tone.withChannel(intent.channel) { ch ->
         ch.copy(points = (ch.points + intent.point).sortedBy { it.x })
@@ -68,8 +67,13 @@ fun reduce(state: LuxState, intent: LuxIntent): LuxState = when (intent) {
         presets = state.presets.filterNot { it.id == intent.id },
         activePresetId = if (state.activePresetId == intent.id) null else state.activePresetId,
     )
+    is LuxIntent.SetPresetList      -> state.copy(presets = intent.presets)
 
-    is LuxIntent.ResetAll           -> LuxState(sourceUri = state.sourceUri, presets = state.presets)
+    is LuxIntent.ResetAll           -> LuxState(
+        previewUri = state.previewUri,
+        references = state.references,
+        presets = state.presets,
+    )
 
     // Undo/Redo are handled by the Store wrapping the reducer.
     LuxIntent.Undo, LuxIntent.Redo  -> state

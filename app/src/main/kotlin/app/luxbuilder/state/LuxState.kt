@@ -106,7 +106,12 @@ data class Preset(
  * undo/redo and preset save/load can snapshot atomically.
  */
 data class LuxState(
-    val sourceUri: Uri? = null,
+    /**
+     * Optional photo shown in the preview. If null, the editor defaults to
+     * the first reference photo — the moodboard-driven workflow doesn't
+     * require a separate source photo; references *are* the input.
+     */
+    val previewUri: Uri? = null,
     val tone: ToneCurves = ToneCurves(),
     val lgg: Lgg = Lgg(),
     val hsl: HslPanel = HslPanel(),
@@ -123,6 +128,14 @@ data class LuxState(
     val presets: List<Preset> = emptyList(),
     val activePresetId: String? = null,
 ) {
+    /**
+     * The effective photo URI to render in the preview. Falls back to the
+     * first reference when no explicit preview is selected, so a moodboard
+     * import without a chosen source still shows something meaningful.
+     */
+    val effectivePreviewUri: Uri?
+        get() = previewUri ?: references.firstOrNull()?.uri
+
     val isIdentity: Boolean
         get() = tone.isIdentity && lgg.lift.isNeutral && lgg.gamma.isNeutral && lgg.gain.isNeutral &&
                 hsl.isNeutral && wb.isNeutral && basics.isNeutral && mklStrength == 0f
@@ -141,7 +154,7 @@ data class LuxState(
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is LuxState) return false
-        return sourceUri == other.sourceUri &&
+        return previewUri == other.previewUri &&
             tone == other.tone && lgg == other.lgg && hsl == other.hsl &&
             wb == other.wb && basics == other.basics &&
             mklMatrix.contentEquals(other.mklMatrix) &&
@@ -151,7 +164,7 @@ data class LuxState(
             activePresetId == other.activePresetId
     }
     override fun hashCode(): Int {
-        var h = sourceUri?.hashCode() ?: 0
+        var h = previewUri?.hashCode() ?: 0
         h = 31 * h + tone.hashCode()
         h = 31 * h + lgg.hashCode()
         h = 31 * h + hsl.hashCode()

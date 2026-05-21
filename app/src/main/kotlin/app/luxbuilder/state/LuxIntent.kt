@@ -8,9 +8,8 @@ import android.net.Uri
  * reducer and dispatch follow-up intents with the results.
  */
 sealed interface LuxIntent {
-    // Source photo for live preview
-    data class SetSource(val uri: Uri) : LuxIntent
-    data object ClearSource : LuxIntent
+    // Preview photo selection (optional; defaults to first reference when null)
+    data class SetPreview(val uri: Uri?) : LuxIntent
 
     // Tone curve
     data class AddCurvePoint(val channel: ToneChannel, val point: CurvePoint) : LuxIntent
@@ -56,6 +55,8 @@ sealed interface LuxIntent {
     data class SavePreset(val name: String) : LuxIntent
     data class LoadPreset(val id: String) : LuxIntent
     data class DeletePreset(val id: String) : LuxIntent
+    /** Hydrate the preset list from persistence — used at boot, not in undo history. */
+    data class SetPresetList(val presets: List<Preset>) : LuxIntent
 
     // Global
     data object ResetAll : LuxIntent

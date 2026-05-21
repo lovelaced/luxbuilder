@@ -4,6 +4,7 @@ import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +21,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import app.luxbuilder.gpu.PipelineShader
 import app.luxbuilder.gpu.ShaderUniforms
@@ -30,9 +32,7 @@ import app.luxbuilder.ui.theme.Lux
  * Live preview of the source photo with the full grading pipeline applied
  * via an AGSL RuntimeShader bound through Modifier.graphicsLayer.
  *
- * Uniforms are re-bound on every [state] change. The shader and its
- * ShaderUniforms helper are remembered across recompositions — creating a
- * fresh RuntimeShader every frame would thrash the GPU pipeline cache.
+ * Triple-tap toggles a hairline RGB histogram overlay.
  */
 @Composable
 fun PreviewSurface(
@@ -42,12 +42,9 @@ fun PreviewSurface(
 ) {
     val colors = Lux.colors
 
-    // Built once, reused — uniform updates are cheap, shader compile is not.
     val shader = remember { RuntimeShader(PipelineShader.SOURCE) }
     val uniforms = remember(shader) { ShaderUniforms(shader) }
 
-    // Re-bind uniforms whenever state changes. RenderEffect is rebuilt to pick
-    // up new uniform values (RenderEffect snapshots uniforms at construction).
     var renderEffect by remember { mutableStateOf<androidx.compose.ui.graphics.RenderEffect?>(null) }
     LaunchedEffect(state) {
         uniforms.bind(state)
@@ -55,12 +52,28 @@ fun PreviewSurface(
             .asComposeRenderEffect()
     }
 
+    var showHistogram by remember { mutableStateOf(false) }
     val imageBitmap: ImageBitmap? = remember(bitmap) { bitmap?.asImageBitmap() }
 
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .background(colors.bg),
+            .background(colors.bg)
+            .pointerInput(Unit) {
+                var tapCount = 0
+                var lastTap = 0L
+                detectTapGestures(
+                    onTap = {
+                        val now = System.currentTimeMillis()
+                        tapCount = if (now - lastTap < 350) tapCount + 1 else 1
+                        lastTap = now
+                        if (tapCount >= 3) {
+                            showHistogram = !showHistogram
+                            tapCount = 0
+                        }
+                    },
+                )
+            },
         contentAlignment = Alignment.Center,
     ) {
         if (imageBitmap == null) {
@@ -72,15 +85,23 @@ fun PreviewSurface(
             )
         } else {
             val aspect = imageBitmap.width.toFloat() / imageBitmap.height.toFloat()
-            Image(
-                bitmap = imageBitmap,
-                contentDescription = null,
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .aspectRatio(aspect)
-                    .graphicsLayer { this.renderEffect = renderEffect },
-                contentScale = ContentScale.Fit,
-            )
+                    .aspectRatio(aspect),
+            ) {
+                Image(
+                    bitmap = imageBitmap,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { this.renderEffect = renderEffect },
+                    contentScale = ContentScale.Fit,
+                )
+                if (showHistogram) {
+                    HistogramOverlay(bitmap = bitmap, modifier = Modifier.fillMaxSize())
+                }
+            }
         }
     }
 }
