@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">luxbuilder</string>
+    <string name="share_label">luxbuilder</string>
+
+    <string name="empty_hero">Build a look.</string>
+    <string name="empty_subtitle">Pick a photo to start grading · drop references to color-match</string>
+    <string name="empty_cta">Choose Photo</string>
+
+    <string name="tab_tone">TONE</string>
+    <string name="tab_wheels">WHEELS</string>
+    <string name="tab_hsl">HSL</string>
+    <string name="tab_wb">WB</string>
+    <string name="tab_basic">SAT/CON</string>
+    <string name="tab_presets">PRE</string>
+
+    <string name="save_preset">Save Preset</string>
+    <string name="export">Export…</string>
+    <string name="export_cube">.cube · universal</string>
+    <string name="export_vlt">.vlt · Lumix camera</string>
+
+    <string name="error_unsupported">Unsupported file type</string>
+    <string name="error_save_failed">Save failed</string>
+</resources>

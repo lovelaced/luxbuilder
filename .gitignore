@@ -1,0 +1,14 @@
+.gradle/
+build/
+local.properties
+.idea/
+.DS_Store
+*.iml
+captures/
+.cxx/
+app/release/
+*.jpg
+*.jpeg
+*.png
+!app/src/main/res/**/*.png
+!assets/**/*.png

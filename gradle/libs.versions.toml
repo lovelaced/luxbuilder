@@ -1,0 +1,46 @@
+[versions]
+agp = "9.2.0"
+kotlin = "2.3.10"
+
+composeBom = "2026.05.00"
+composeMaterial3 = "1.5.0-alpha19"
+
+activityCompose = "1.12.0-rc01"
+coreKtx = "1.16.0"
+lifecycle = "2.10.0"
+splashScreen = "1.2.0-rc01"
+datastore = "1.2.0"
+documentfile = "1.1.0"
+exifinterface = "1.4.2"
+
+coroutines = "1.10.2"
+desugar = "2.1.5"
+
+[libraries]
+compose-bom                  = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+compose-ui                   = { group = "androidx.compose.ui", name = "ui" }
+compose-ui-graphics          = { group = "androidx.compose.ui", name = "ui-graphics" }
+compose-ui-tooling           = { group = "androidx.compose.ui", name = "ui-tooling" }
+compose-ui-tooling-preview   = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+compose-ui-text-google-fonts = { group = "androidx.compose.ui", name = "ui-text-google-fonts" }
+compose-foundation           = { group = "androidx.compose.foundation", name = "foundation" }
+compose-material3            = { group = "androidx.compose.material3", name = "material3", version.ref = "composeMaterial3" }
+
+androidx-activity-compose          = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-core-ktx                  = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-core-splashscreen         = { group = "androidx.core", name = "core-splashscreen", version.ref = "splashScreen" }
+androidx-lifecycle-runtime         = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel       = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+androidx-datastore                 = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
+androidx-documentfile              = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
+androidx-exifinterface             = { group = "androidx.exifinterface", name = "exifinterface", version.ref = "exifinterface" }
+
+kotlinx-coroutines-android   = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+
+desugar-jdk-libs             = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+# Kotlin is built into AGP 9.0+; only the Compose Compiler plugin is applied separately.
+kotlin-compose      = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
