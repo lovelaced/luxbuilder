@@ -18,8 +18,8 @@ package app.luxbuilder.gpu
  *
  * Uniforms (set via PipelineShader.bind()):
  *   uniform shader composable           // the source preview image
- *   uniform shader toneCurve            // 1024×1 R8 BitmapShader, the master luma curve
- *   uniform float   uHasToneCurve       // 1.0 if curve != identity, else 0.0
+ *   uniform shader toneCurve            // 1024×4 RGBA BitmapShader — rows: luma, R, G, B
+ *   uniform float4  uHasCurve           // per-row enabled flag (luma, R, G, B)
  *
  *   uniform float3  uWbGains            // per-channel multiplicative gains in linear sRGB
  *
@@ -46,7 +46,7 @@ object PipelineShader {
     val SOURCE: String = """
         uniform shader composable;
         uniform shader toneCurve;
-        uniform float  uHasToneCurve;
+        uniform float4 uHasCurve;     // (luma, R, G, B) — 1.0 = active, 0.0 = identity
 
         uniform float3 uWbGains;
 
@@ -130,10 +130,10 @@ object PipelineShader {
             return float3(cfg.x * w, 1.0 + cfg.y * w, 1.0 + cfg.z * w);
         }
 
-        // Sample the 1024×1 luma tone curve. toneCurve is bound to a BitmapShader
-        // — sample at (x*1024, 0.5) and read the red channel.
-        float sampleCurve(float x) {
-            return toneCurve.eval(float2(clamp(x, 0.0, 1.0) * 1024.0, 0.5)).r;
+        // Sample row `row` (0..3) of the 1024×4 RGBA curve bitmap. We read the
+        // red channel — all RGB channels are packed identically in each pixel.
+        float sampleCurveRow(float x, int row) {
+            return toneCurve.eval(float2(clamp(x, 0.0, 1.0) * 1024.0, float(row) + 0.5)).r;
         }
 
         half4 main(float2 coords) {
@@ -167,13 +167,17 @@ object PipelineShader {
             rgb = cdl(rgb, uGamma_slope, uGamma_offset, uGamma_power);
             rgb = cdl(rgb, uGain_slope,  uGain_offset,  uGain_power);
 
-            // 5. Tone curve — master luma applied as luminance delta
-            if (uHasToneCurve > 0.5) {
+            // 5a. Master luma curve applied as luminance delta
+            if (uHasCurve.x > 0.5) {
                 float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
-                float yNew = sampleCurve(y);
+                float yNew = sampleCurveRow(y, 0);
                 float dy = yNew - y;
                 rgb = rgb + float3(dy);
             }
+            // 5b. Per-channel R/G/B curves applied directly
+            if (uHasCurve.y > 0.5) rgb.r = sampleCurveRow(clamp(rgb.r, 0.0, 1.0), 1);
+            if (uHasCurve.z > 0.5) rgb.g = sampleCurveRow(clamp(rgb.g, 0.0, 1.0), 2);
+            if (uHasCurve.w > 0.5) rgb.b = sampleCurveRow(clamp(rgb.b, 0.0, 1.0), 3);
 
             // 6. HSL six-color
             float3 hsv = rgb2hsv(clamp(rgb, 0.0, 1.0));

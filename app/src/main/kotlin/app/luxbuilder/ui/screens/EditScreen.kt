@@ -20,7 +20,12 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -65,11 +70,25 @@ fun EditScreen(
             .background(colors.bg)
             .windowInsetsPadding(WindowInsets.statusBars),
     ) {
+        // Compute whether the current grade matches the active preset's snapshot.
+        // True → the calm amber pulse plays beneath the header label.
+        val activePreset = state.presets.firstOrNull { it.id == state.activePresetId }
+        val atActivePreset = activePreset != null && state.gradeSnapshot() ==
+            app.luxbuilder.state.GradeSnapshot(
+                tone = activePreset.tone,
+                lgg = activePreset.lgg,
+                hsl = activePreset.hsl,
+                wb = activePreset.wb,
+                basics = activePreset.basics,
+                mklStrength = activePreset.mklStrength,
+            )
+
         Header(
             store = store,
             refs = state.references.size,
             canUndo = store.canUndo,
             canRedo = store.canRedo,
+            atPresetName = if (atActivePreset) activePreset?.name else null,
             onShowPresets = onShowPresets,
             onExport = onExport,
         )
@@ -160,22 +179,53 @@ private fun Header(
     refs: Int,
     canUndo: Boolean,
     canRedo: Boolean,
+    atPresetName: String?,
     onShowPresets: () -> Unit,
     onExport: () -> Unit,
 ) {
     val colors = Lux.colors
+
+    // The "AT PRESET · name" pulse — runs only while atPresetName != null.
+    val pulse = remember { androidx.compose.animation.core.Animatable(0.3f) }
+    androidx.compose.runtime.LaunchedEffect(atPresetName) {
+        if (atPresetName != null) {
+            pulse.snapTo(0.3f)
+            pulse.animateTo(
+                1f,
+                animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+                    animation = androidx.compose.animation.core.tween(
+                        durationMillis = 2400,
+                        easing = androidx.compose.animation.core.EaseInOut,
+                    ),
+                    repeatMode = androidx.compose.animation.core.RepeatMode.Reverse,
+                ),
+            )
+        } else {
+            pulse.snapTo(0.3f)
+        }
+    }
+
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = LuxSpacing.lg, vertical = LuxSpacing.sm),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = "luxbuilder · $refs REF${if (refs != 1) "S" else ""}",
-            style = Lux.type.labelMono,
-            color = colors.textTertiary,
-            modifier = Modifier.weight(1f),
-        )
+        if (atPresetName != null) {
+            Text(
+                text = "AT PRESET · ${atPresetName.uppercase()}",
+                style = Lux.type.labelMono,
+                color = colors.accent.copy(alpha = pulse.value),
+                modifier = Modifier.weight(1f),
+            )
+        } else {
+            Text(
+                text = "luxbuilder · $refs REF${if (refs != 1) "S" else ""}",
+                style = Lux.type.labelMono,
+                color = colors.textTertiary,
+                modifier = Modifier.weight(1f),
+            )
+        }
         HeaderChip(label = "↶", enabled = canUndo) { store.dispatch(LuxIntent.Undo) }
         Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xxs))
         HeaderChip(label = "↷", enabled = canRedo) { store.dispatch(LuxIntent.Redo) }
@@ -282,26 +332,92 @@ private fun ChipMini(label: String, active: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun TonePage(store: LuxStore, state: LuxState) {
+    var activeChannel by rememberSaveable { mutableStateOf(ToneChannel.LUMA) }
+    val activeCurve = when (activeChannel) {
+        ToneChannel.LUMA  -> state.tone.luma
+        ToneChannel.RED   -> state.tone.red
+        ToneChannel.GREEN -> state.tone.green
+        ToneChannel.BLUE  -> state.tone.blue
+    }
+    val ghosts = mapOf(
+        ToneChannel.LUMA  to state.tone.luma,
+        ToneChannel.RED   to state.tone.red,
+        ToneChannel.GREEN to state.tone.green,
+        ToneChannel.BLUE  to state.tone.blue,
+    )
+
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = LuxSpacing.lg)) {
-        Text(
-            text = "MASTER · LUMA",
-            style = Lux.type.labelMono,
-            color = Lux.colors.textTertiary,
-            modifier = Modifier.padding(bottom = LuxSpacing.sm),
+        ChannelPills(
+            active = activeChannel,
+            onSelect = { activeChannel = it },
         )
+        Spacer(modifier = Modifier.height(LuxSpacing.sm))
         ToneCurveEditor(
-            channel = ToneChannel.LUMA,
-            curve = state.tone.luma,
-            onAddPoint = { p -> store.dispatch(LuxIntent.AddCurvePoint(ToneChannel.LUMA, p)) },
-            onMovePoint = { i, p -> store.dispatch(LuxIntent.MoveCurvePoint(ToneChannel.LUMA, i, p)) },
-            onRemovePoint = { i -> store.dispatch(LuxIntent.RemoveCurvePoint(ToneChannel.LUMA, i)) },
-            onResetChannel = { store.dispatch(LuxIntent.ResetCurveChannel(ToneChannel.LUMA)) },
+            channel = activeChannel,
+            curve = activeCurve,
+            ghostCurves = ghosts,
+            onAddPoint = { p -> store.dispatch(LuxIntent.AddCurvePoint(activeChannel, p)) },
+            onMovePoint = { i, p -> store.dispatch(LuxIntent.MoveCurvePoint(activeChannel, i, p)) },
+            onRemovePoint = { i -> store.dispatch(LuxIntent.RemoveCurvePoint(activeChannel, i)) },
+            onResetChannel = { store.dispatch(LuxIntent.ResetCurveChannel(activeChannel)) },
         )
         Spacer(modifier = Modifier.height(LuxSpacing.md))
         Text(
-            text = "Tap to add a point · drag to move · long-press to remove · two-finger to reset",
+            text = "Tap to add · drag to move · long-press point to remove · long-press grid to reset channel",
             style = Lux.type.numMicro,
             color = Lux.colors.textTertiary,
         )
     }
+}
+
+@Composable
+private fun ChannelPills(active: ToneChannel, onSelect: (ToneChannel) -> Unit) {
+    val colors = Lux.colors
+    val haptics = Lux.haptics
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(LuxSpacing.xs),
+    ) {
+        ToneChannel.entries.forEach { ch ->
+            val isActive = ch == active
+            val signal = when (ch) {
+                ToneChannel.LUMA  -> colors.signalLuma
+                ToneChannel.RED   -> colors.signalRed
+                ToneChannel.GREEN -> colors.signalGreen
+                ToneChannel.BLUE  -> colors.signalBlue
+            }
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(if (isActive) colors.surface3 else colors.surface1)
+                    .border(
+                        1.dp,
+                        if (isActive) signal else colors.stroke,
+                        RoundedCornerShape(2.dp),
+                    )
+                    .clickable {
+                        if (!isActive) {
+                            haptics.detent()
+                            onSelect(ch)
+                        }
+                    }
+                    .padding(vertical = LuxSpacing.sm),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = ch.label(),
+                    style = Lux.type.labelMono,
+                    color = if (isActive) signal else colors.textSecondary,
+                )
+            }
+        }
+    }
+}
+
+private fun ToneChannel.label(): String = when (this) {
+    ToneChannel.LUMA  -> "LUMA"
+    ToneChannel.RED   -> "R"
+    ToneChannel.GREEN -> "G"
+    ToneChannel.BLUE  -> "B"
 }

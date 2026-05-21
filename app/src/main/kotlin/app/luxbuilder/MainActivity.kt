@@ -47,6 +47,7 @@ import app.luxbuilder.photo.PhotoSource
 import app.luxbuilder.photo.PhotoStats
 import app.luxbuilder.settings.UserPrefs
 import app.luxbuilder.share.parseIncomingUris
+import app.luxbuilder.ui.components.ExportSweep
 import app.luxbuilder.state.LuxIntent
 import app.luxbuilder.state.LuxStore
 import app.luxbuilder.state.Preset
@@ -153,26 +154,39 @@ private fun AppRoot(store: LuxStore) {
     var pendingExport by remember {
         mutableStateOf<Triple<LutExporter.Format, String, LutExporter.Destination>?>(null)
     }
+    // Export sweep state: bumping `sweepKey` triggers a fresh animation; the
+    // line shown beneath is `sweepLine`.
+    var sweepKey by remember { mutableStateOf(0) }
+    var sweepLine by remember { mutableStateOf<String?>(null) }
+
+    fun fireSweep(line: String) {
+        sweepLine = line
+        sweepKey += 1
+    }
+
     val pickFolder = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { tree ->
         if (tree != null) scope.launch {
             SafFolder.setFolder(context, tree)
             pendingExport?.let { (fmt, name, dest) ->
-                LutExporter.export(context, state, fmt, name, dest)
+                val result = LutExporter.export(context, state, fmt, name, dest)
+                if (result is LutExporter.Result.Saved) {
+                    fireSweep(displayPath(result.uri, result.filename))
+                }
                 pendingExport = null
             }
         }
     }
     suspend fun runExport(fmt: LutExporter.Format, name: String, dest: LutExporter.Destination) {
-        val result = LutExporter.export(context, state, fmt, name, dest)
-        when (result) {
+        when (val result = LutExporter.export(context, state, fmt, name, dest)) {
             is LutExporter.Result.NeedsFolderPick -> {
                 pendingExport = Triple(result.pendingFormat, result.pendingFilename, LutExporter.Destination.SAF_FOLDER)
                 pickFolder.launch(null)
             }
             is LutExporter.Result.Failed -> android.util.Log.e("luxbuilder", "export failed: ${result.reason}")
-            else -> Unit
+            is LutExporter.Result.Saved -> fireSweep(displayPath(result.uri, result.filename))
+            is LutExporter.Result.Shared -> fireSweep("share · ${result.filename}")
         }
     }
 
@@ -230,6 +244,17 @@ private fun AppRoot(store: LuxStore) {
             )
         }
     }
+    // Sweep overlay — sits at the root so it crosses the whole screen
+    ExportSweep(
+        key = if (sweepKey == 0) null else sweepKey,
+        destinationLine = sweepLine,
+    )
+}
+
+private fun displayPath(uri: android.net.Uri, filename: String): String {
+    // The SAF URI is opaque ("content://com.android.externalstorage..."). Show
+    // just the filename — that's all the photographer actually needs to confirm.
+    return filename
 }
 
 /**

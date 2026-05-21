@@ -47,12 +47,14 @@ class ShaderUniforms(val shader: RuntimeShader) {
         bindLgg("uGamma", state.lgg.gamma)
         bindLgg("uGain",  state.lgg.gain)
 
-        // 5. Tone curve — luma channel only in v1
-        val curve = ColorPipeline.buildTables(state).tone.luma
-        val (bitmap, isIdentity) = buildCurveBitmap(curve)
+        // 5. Tone curves — all four channels packed into a 1024×4 RGBA bitmap
+        val toneTables = ColorPipeline.buildTables(state).tone
+        val (bitmap, hasFlags) = buildCurveBitmap(
+            toneTables.luma, toneTables.red, toneTables.green, toneTables.blue
+        )
         curveBitmap = bitmap
         shader.setInputShader("toneCurve", BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP))
-        shader.setFloatUniform("uHasToneCurve", if (isIdentity) 0f else 1f)
+        shader.setFloatUniform("uHasCurve", hasFlags[0], hasFlags[1], hasFlags[2], hasFlags[3])
 
         // 6. HSL anchors — pack as 6 vec3s (hueShiftDeg, satScale, valScale)
         bindHslAnchor("uHsl_red",    state.hsl.anchors[HslColor.RED]    ?: HslAnchor())
@@ -114,23 +116,38 @@ class ShaderUniforms(val shader: RuntimeShader) {
     }
 
     /**
-     * Pack the 1024-sample luma curve into a 1024×1 ALPHA_8 bitmap. The shader
-     * samples this as a BitmapShader and reads the red channel (which equals
-     * alpha for ALPHA_8). Returns (bitmap, isIdentity).
+     * Pack four 1024-sample curve tables into a 1024×4 ARGB_8888 bitmap, one
+     * row per channel in (luma, R, G, B) order. The shader samples the red
+     * channel of each pixel; all RGB channels of a given pixel encode the
+     * same value, so the shader sees scalar curve data.
+     *
+     * Returns the bitmap plus a 4-float identity-flag array (1.0 if the curve
+     * actively transforms the channel, 0.0 if it's identity within tolerance).
      */
-    private fun buildCurveBitmap(table: FloatArray): Pair<Bitmap, Boolean> {
-        val bmp = Bitmap.createBitmap(table.size, 1, Bitmap.Config.ARGB_8888)
-        val pixels = IntArray(table.size)
-        var identity = true
-        for (i in table.indices) {
-            val expected = i.toFloat() / (table.size - 1)
-            if (kotlin.math.abs(table[i] - expected) > 1e-4f) identity = false
-            val v = (table[i].coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255)
-            // pack v into all three RGB channels + opaque alpha
-            pixels[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+    private fun buildCurveBitmap(
+        luma: FloatArray,
+        red: FloatArray,
+        green: FloatArray,
+        blue: FloatArray,
+    ): Pair<Bitmap, FloatArray> {
+        val w = luma.size
+        val bmp = Bitmap.createBitmap(w, 4, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(w * 4)
+        val rows = arrayOf(luma, red, green, blue)
+        val flags = FloatArray(4)
+        for (row in 0..3) {
+            val table = rows[row]
+            var identity = true
+            for (i in 0 until w) {
+                val expected = i.toFloat() / (w - 1)
+                if (kotlin.math.abs(table[i] - expected) > 1e-4f) identity = false
+                val v = (table[i].coerceIn(0f, 1f) * 255f + 0.5f).toInt().coerceIn(0, 255)
+                pixels[row * w + i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+            }
+            flags[row] = if (identity) 0f else 1f
         }
-        bmp.setPixels(pixels, 0, table.size, 0, 0, table.size, 1)
-        return bmp to identity
+        bmp.setPixels(pixels, 0, w, 0, 0, w, 4)
+        return bmp to flags
     }
 
     @Suppress("unused") private val ToneCurveUnused = ToneCurve  // import keep

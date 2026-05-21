@@ -50,6 +50,7 @@ import app.luxbuilder.ui.theme.LuxSpacing
 fun ToneCurveEditor(
     channel: ToneChannel,
     curve: CurveChannel,
+    ghostCurves: Map<ToneChannel, CurveChannel> = emptyMap(),
     onAddPoint: (CurvePoint) -> Unit,
     onMovePoint: (Int, CurvePoint) -> Unit,
     onRemovePoint: (Int) -> Unit,
@@ -163,7 +164,29 @@ fun ToneCurveEditor(
                 strokeWidth = 1f,
             )
 
-            // Sample the curve and draw it as a stroked polyline
+            // Ghost lines: non-active channels rendered at 12% opacity so the
+            // user sees what other channels are doing without competing
+            ghostCurves.forEach { (ch, ghostCurve) ->
+                if (ch == channel) return@forEach
+                if (ghostCurve.points.isEmpty()) return@forEach
+                val gColor = when (ch) {
+                    ToneChannel.LUMA  -> colors.signalLuma
+                    ToneChannel.RED   -> colors.signalRed
+                    ToneChannel.GREEN -> colors.signalGreen
+                    ToneChannel.BLUE  -> colors.signalBlue
+                }.copy(alpha = 0.12f)
+                val gTable = ToneCurve.sample(ghostCurve, 128)
+                val gPath = Path().apply {
+                    for (i in gTable.indices) {
+                        val x = i * (w / (gTable.size - 1))
+                        val y = (1f - gTable[i]) * h
+                        if (i == 0) moveTo(x, y) else lineTo(x, y)
+                    }
+                }
+                drawPath(gPath, gColor, style = Stroke(width = 1.5f))
+            }
+
+            // Active curve — sampled and drawn as a stroked polyline
             val table = ToneCurve.sample(curve, 128)
             val path = Path().apply {
                 for (i in table.indices) {
