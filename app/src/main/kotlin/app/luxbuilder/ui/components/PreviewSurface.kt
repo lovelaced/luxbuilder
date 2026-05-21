@@ -55,6 +55,13 @@ import kotlinx.coroutines.launch
 fun PreviewSurface(
     bitmap: android.graphics.Bitmap?,
     state: LuxState,
+    /**
+     * When false, render the source bitmap as-is with no grading applied.
+     * Used when the user is viewing a reference photo — references ARE the
+     * target look, applying the LUT to them would be a recursive lie.
+     * Also disables A/B linger (no "graded" side to compare against).
+     */
+    applyShader: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     val colors = Lux.colors
@@ -107,11 +114,14 @@ fun PreviewSurface(
             )
         } else {
             val aspect = imageBitmap.width.toFloat() / imageBitmap.height.toFloat()
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(aspect)
-                    .pointerInput(Unit) {
+            // A/B linger is only meaningful when there's a graded layer to compare
+            // against. With applyShader=false (viewing a reference), the gesture
+            // box is omitted entirely.
+            val photoBoxModifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(aspect)
+                .let { m ->
+                    if (!applyShader) m else m.pointerInput(Unit) {
                         detectHorizontalDragGestures(
                             onDragStart = { start ->
                                 lingerJob?.cancel()
@@ -138,9 +148,13 @@ fun PreviewSurface(
                             },
                             onDragCancel = { splitX = null },
                         )
-                    },
-            ) {
-                // Layer 1: original photo (no shader)
+                    }
+                }
+
+            Box(modifier = photoBoxModifier) {
+                // Always-on: original photo (no shader). For applyShader=false
+                // this is the only layer that renders, leaving the reference
+                // photo untouched.
                 Image(
                     bitmap = imageBitmap,
                     contentDescription = null,
@@ -148,44 +162,45 @@ fun PreviewSurface(
                     contentScale = ContentScale.Fit,
                 )
 
-                // Layer 2: graded photo (with shader). Clipped to x > splitX
-                // when a split is active so the original shows through on the left.
-                val currentSplit = splitX
-                Image(
-                    bitmap = imageBitmap,
-                    contentDescription = null,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer { this.renderEffect = renderEffect }
-                        .drawWithContent {
-                            if (currentSplit == null) {
-                                drawContent()
-                            } else {
-                                val sx = currentSplit * size.width
-                                clipRect(left = sx, top = 0f, right = size.width, bottom = size.height) {
-                                    this@drawWithContent.drawContent()
-                                }
-                            }
-                        },
-                    contentScale = ContentScale.Fit,
-                )
-
-                // Split line overlay
-                if (currentSplit != null) {
-                    Box(
+                if (applyShader) {
+                    // Layer 2: graded photo (with shader). Clipped to x > splitX
+                    // when a split is active so the original shows through on the left.
+                    val currentSplit = splitX
+                    Image(
+                        bitmap = imageBitmap,
+                        contentDescription = null,
                         modifier = Modifier
                             .fillMaxSize()
-                            .alpha(splitAlpha.value)
+                            .graphicsLayer { this.renderEffect = renderEffect }
                             .drawWithContent {
-                                val sx = currentSplit * size.width
-                                drawLine(
-                                    color = Color(0xFFE8B23A),
-                                    start = Offset(sx, 0f),
-                                    end = Offset(sx, size.height),
-                                    strokeWidth = 1.5f,
-                                )
+                                if (currentSplit == null) {
+                                    drawContent()
+                                } else {
+                                    val sx = currentSplit * size.width
+                                    clipRect(left = sx, top = 0f, right = size.width, bottom = size.height) {
+                                        this@drawWithContent.drawContent()
+                                    }
+                                }
                             },
+                        contentScale = ContentScale.Fit,
                     )
+
+                    if (currentSplit != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .alpha(splitAlpha.value)
+                                .drawWithContent {
+                                    val sx = currentSplit * size.width
+                                    drawLine(
+                                        color = Color(0xFFE8B23A),
+                                        start = Offset(sx, 0f),
+                                        end = Offset(sx, size.height),
+                                        strokeWidth = 1.5f,
+                                    )
+                                },
+                        )
+                    }
                 }
 
                 if (showHistogram) {

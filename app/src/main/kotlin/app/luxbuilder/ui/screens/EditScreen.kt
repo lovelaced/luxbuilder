@@ -13,8 +13,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -114,12 +117,35 @@ fun EditScreen(
             )
         }
 
-        // Preview
+        // Preview. References display as-is (the LUT is *derived from* them —
+        // applying the LUT to a reference would be a recursive lie). Any
+        // other photo (e.g. one the user picked via "MY PHOTO…") gets the
+        // grading shader applied so it's a real test surface for the look.
+        val viewingReference = state.effectivePreviewUri != null &&
+            state.references.any { it.uri == state.effectivePreviewUri }
+
         Box(
             modifier = Modifier.fillMaxWidth(),
             contentAlignment = Alignment.Center,
         ) {
-            PreviewSurface(bitmap = bitmap, state = state)
+            PreviewSurface(
+                bitmap = bitmap,
+                state = state,
+                applyShader = !viewingReference,
+            )
+        }
+
+        // Tiny caption clarifying which mode the preview is in
+        if (state.references.isNotEmpty()) {
+            Text(
+                text = if (viewingReference)
+                    "VIEWING REFERENCE · AS-IS · LUT IS DERIVED FROM THIS"
+                else
+                    "VIEWING YOUR PHOTO · LUT APPLIED",
+                style = Lux.type.labelMono,
+                color = if (viewingReference) Lux.colors.textTertiary else Lux.colors.accent.copy(alpha = 0.7f),
+                modifier = Modifier.padding(horizontal = LuxSpacing.lg, vertical = LuxSpacing.xs),
+            )
         }
 
         // Preview-source switcher
@@ -346,27 +372,41 @@ private fun TonePage(store: LuxStore, state: LuxState) {
         ToneChannel.BLUE  to state.tone.blue,
     )
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = LuxSpacing.lg)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = LuxSpacing.lg),
+    ) {
         ChannelPills(
             active = activeChannel,
             onSelect = { activeChannel = it },
         )
         Spacer(modifier = Modifier.height(LuxSpacing.sm))
-        ToneCurveEditor(
-            channel = activeChannel,
-            curve = activeCurve,
-            ghostCurves = ghosts,
-            onAddPoint = { p -> store.dispatch(LuxIntent.AddCurvePoint(activeChannel, p)) },
-            onMovePoint = { i, p -> store.dispatch(LuxIntent.MoveCurvePoint(activeChannel, i, p)) },
-            onRemovePoint = { i -> store.dispatch(LuxIntent.RemoveCurvePoint(activeChannel, i)) },
-            onResetChannel = { store.dispatch(LuxIntent.ResetCurveChannel(activeChannel)) },
-        )
+        // Center the curve and cap its size — full-width was overwhelming and
+        // left no room for the help text or scroll headroom.
+        Box(
+            modifier = Modifier.fillMaxWidth(),
+            contentAlignment = Alignment.Center,
+        ) {
+            ToneCurveEditor(
+                channel = activeChannel,
+                curve = activeCurve,
+                ghostCurves = ghosts,
+                onAddPoint = { p -> store.dispatch(LuxIntent.AddCurvePoint(activeChannel, p)) },
+                onMovePoint = { i, p -> store.dispatch(LuxIntent.MoveCurvePoint(activeChannel, i, p)) },
+                onRemovePoint = { i -> store.dispatch(LuxIntent.RemoveCurvePoint(activeChannel, i)) },
+                onResetChannel = { store.dispatch(LuxIntent.ResetCurveChannel(activeChannel)) },
+                modifier = Modifier.size(280.dp),
+            )
+        }
         Spacer(modifier = Modifier.height(LuxSpacing.md))
         Text(
             text = "Tap to add · drag to move · long-press point to remove · long-press grid to reset channel",
             style = Lux.type.numMicro,
             color = Lux.colors.textTertiary,
         )
+        Spacer(modifier = Modifier.height(LuxSpacing.xxl))
     }
 }
 
