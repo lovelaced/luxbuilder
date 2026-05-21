@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="200" height="200" fill="none">
+  <!-- Outer calibration frame -->
+  <path d="M 10 10 L 54 10 L 54 54 L 10 54 Z"
+        stroke="#3A3A3F" stroke-width="1.5" fill="none"/>
+  <!-- Quadrant gridlines -->
+  <path d="M 32 10 L 32 54 M 10 32 L 54 32"
+        stroke="#2A2A2E" stroke-width="1" fill="none"/>
+  <!-- The tone curve -->
+  <path d="M 10 54 C 24 50, 28 22, 54 10"
+        stroke="#E8B23A" stroke-width="2.4" stroke-linecap="round" fill="none"/>
+  <!-- Endpoint dots -->
+  <circle cx="10" cy="54" r="2.2" fill="#E8B23A"/>
+  <circle cx="54" cy="10" r="2.2" fill="#E8B23A"/>
+</svg>

@@ -24,16 +24,25 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import app.luxbuilder.color.Mkl
+import app.luxbuilder.color.NaturalImagePrior
+import app.luxbuilder.io.LutExporter
+import app.luxbuilder.io.SafFolder
 import app.luxbuilder.photo.PhotoSource
+import app.luxbuilder.photo.PhotoStats
+import app.luxbuilder.share.parseIncomingUris
 import app.luxbuilder.state.LuxIntent
 import app.luxbuilder.state.LuxStore
 import app.luxbuilder.ui.screens.EditScreen
+import app.luxbuilder.ui.screens.ExportSheet
 import app.luxbuilder.ui.theme.Lux
+import kotlinx.coroutines.launch
 import app.luxbuilder.ui.theme.LuxSpacing
 import app.luxbuilder.ui.theme.LuxTheme
 
@@ -46,11 +55,21 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Pull any shared/viewed image URIs into the store as references.
+        val incoming = parseIncomingUris(intent)
+        if (incoming.isNotEmpty()) store.dispatch(LuxIntent.AddReferences(incoming))
+
         setContent {
             LuxTheme {
                 AppRoot(store)
             }
         }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        val incoming = parseIncomingUris(intent)
+        if (incoming.isNotEmpty()) store.dispatch(LuxIntent.AddReferences(incoming))
     }
 }
 
@@ -71,6 +90,56 @@ private fun AppRoot(store: LuxStore) {
         bitmap = if (uri != null) PhotoSource.decodePreview(context, uri) else null
     }
 
+    // Color-match: when references change, recompute the MKL transform.
+    LaunchedEffect(state.references) {
+        val refUris = state.references.map { it.uri }
+        if (refUris.isEmpty()) {
+            store.dispatch(LuxIntent.ResetMkl, recordInHistory = false)
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(400)  // debounce rapid adds
+        val tgt = PhotoStats.compute(context, refUris) ?: return@LaunchedEffect
+        val transform = Mkl.solve(
+            muSrc = NaturalImagePrior.MU,
+            sigmaSrc = NaturalImagePrior.SIGMA,
+            muTgt = tgt.mu,
+            sigmaTgt = tgt.sigma,
+        )
+        store.dispatch(LuxIntent.SetMklTransform(transform.matrix, transform.bias), recordInHistory = false)
+        if (state.mklStrength == 0f) {
+            store.dispatch(LuxIntent.SetMklStrength(1f), recordInHistory = false)
+        }
+    }
+
+    // Export sheet visibility + pending export request
+    var showExport by remember { mutableStateOf(false) }
+    var pendingExport by remember { mutableStateOf<Triple<LutExporter.Format, String, LutExporter.Destination>?>(null) }
+    val scope = rememberCoroutineScope()
+
+    val pickFolder = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { tree ->
+        if (tree != null) scope.launch {
+            SafFolder.setFolder(context, tree)
+            pendingExport?.let { (fmt, name, dest) ->
+                LutExporter.export(context, state, fmt, name, dest)
+                pendingExport = null
+            }
+        }
+    }
+
+    suspend fun runExport(fmt: LutExporter.Format, name: String, dest: LutExporter.Destination) {
+        val result = LutExporter.export(context, state, fmt, name, dest)
+        when (result) {
+            is LutExporter.Result.NeedsFolderPick -> {
+                pendingExport = Triple(result.pendingFormat, result.pendingFilename, LutExporter.Destination.SAF_FOLDER)
+                pickFolder.launch(null)
+            }
+            is LutExporter.Result.Failed -> android.util.Log.e("luxbuilder", "export failed: ${result.reason}")
+            else -> Unit
+        }
+    }
+
     if (state.sourceUri == null) {
         EmptyScreen(onPickPhoto = {
             pickMedia.launch(PickVisualMediaRequest(
@@ -87,8 +156,17 @@ private fun AppRoot(store: LuxStore) {
                     ActivityResultContracts.PickVisualMedia.ImageOnly
                 ))
             },
-            onExport = { /* Phase 5 */ },
+            onExport = { showExport = true },
         )
+        if (showExport) {
+            ExportSheet(
+                onDismiss = { showExport = false },
+                onConfirm = { fmt, name, dest ->
+                    showExport = false
+                    scope.launch { runExport(fmt, name, dest) }
+                },
+            )
+        }
     }
 }
 

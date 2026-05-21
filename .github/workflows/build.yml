@@ -1,0 +1,79 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required for the Release step on tag pushes
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Stage APK
+        id: stage
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          SRC=$(find app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          SHORT="${GITHUB_SHA::7}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF##refs/tags/}"
+          else
+            VERSION="${SHORT}"
+          fi
+          DEST="out/luxbuilder-${VERSION}.apk"
+          cp "$SRC" "$DEST"
+          echo "apk=$DEST" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luxbuilder-${{ steps.stage.outputs.version }}
+          path: ${{ steps.stage.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create GitHub Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.stage.outputs.apk }}
+          generate_release_notes: true
+          body: |
+            ## luxbuilder ${{ steps.stage.outputs.version }}
+
+            Download the APK below and sideload it onto your Pixel.
+
+            **Install:**
+            1. Download `.apk` to the phone
+            2. Open from your file manager — approve "Install unknown apps" once
+            3. **Updating across CI builds: uninstall the previous version first.** Debug-signed builds use a per-run keystore.
