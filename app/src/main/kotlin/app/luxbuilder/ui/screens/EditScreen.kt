@@ -41,6 +41,7 @@ import app.luxbuilder.ui.components.BasicSliders
 import app.luxbuilder.ui.components.HslPanelView
 import app.luxbuilder.ui.components.LggPanel
 import app.luxbuilder.ui.components.LuxSlider
+import app.luxbuilder.ui.components.PreviewMode
 import app.luxbuilder.ui.components.PreviewSurface
 import app.luxbuilder.ui.components.ReferenceStrip
 import app.luxbuilder.ui.components.TabStrip
@@ -89,6 +90,7 @@ fun EditScreen(
         Header(
             store = store,
             refs = state.references.size,
+            matchScore = state.matchScore,
             canUndo = store.canUndo,
             canRedo = store.canRedo,
             atPresetName = if (atActivePreset) activePreset?.name else null,
@@ -102,6 +104,30 @@ fun EditScreen(
             onAdd = { store.dispatch(LuxIntent.AddReferences(it)) },
             onRemove = { store.dispatch(LuxIntent.RemoveReference(it)) },
         )
+
+        // Auto-fit toggles — STRIP WB and HQ MATCH. Both persist via UserPrefs.
+        if (state.references.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = LuxSpacing.lg, vertical = LuxSpacing.xs),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("AUTO-FIT", style = Lux.type.labelMono, color = colors.textTertiary)
+                Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xs))
+                ChipMini(
+                    label = "STRIP WB",
+                    active = state.stripShootingWb,
+                    onClick = { store.dispatch(LuxIntent.SetStripShootingWb(!state.stripShootingWb)) },
+                )
+                Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xxs))
+                ChipMini(
+                    label = "HQ MATCH",
+                    active = state.highQualityMatch,
+                    onClick = { store.dispatch(LuxIntent.SetHighQualityMatch(!state.highQualityMatch)) },
+                )
+            }
+        }
 
         // Match strength slider — directly above the preview, inline
         Column(
@@ -118,28 +144,33 @@ fun EditScreen(
         }
 
         // References *define* the look — viewing them at LUT-on is a recursive
-        // exaggeration, so the resting state for a reference defaults to
-        // ORIGINAL. User-picked "my photo" defaults to LUT (the whole point
+        // exaggeration, so the resting mode for a reference defaults to
+        // ORIGINAL. User-picked "my photo" defaults to GRADED (the whole point
         // of seeing it is to check the look on a real test surface).
-        // The user can flip the resting state explicitly via the segmented
-        // toggle below, and A/B-drag the preview to compare either way.
+        // SPLIT mode persists indefinitely so the user can tune the grade
+        // against a frozen comparison position; dragging the preview in any
+        // mode auto-switches into SPLIT.
         val viewingReference = state.effectivePreviewUri != null &&
             state.references.any { it.uri == state.effectivePreviewUri }
-        var showGraded by rememberSaveable(state.effectivePreviewUri) {
-            mutableStateOf(!viewingReference)
+        var previewMode by rememberSaveable(state.effectivePreviewUri) {
+            mutableStateOf(if (viewingReference) PreviewMode.ORIGINAL else PreviewMode.GRADED)
         }
 
         Box(
             modifier = Modifier.fillMaxWidth(),
             contentAlignment = Alignment.Center,
         ) {
-            PreviewSurface(bitmap = bitmap, state = state, showGraded = showGraded)
+            PreviewSurface(
+                bitmap = bitmap,
+                state = state,
+                mode = previewMode,
+                onUserDrag = { previewMode = PreviewMode.SPLIT },
+            )
         }
 
-        // Preview-mode toggle + drag hint
         PreviewModeRow(
-            showGraded = showGraded,
-            onSelect = { showGraded = it },
+            mode = previewMode,
+            onSelect = { previewMode = it },
         )
 
         // Preview-source switcher
@@ -197,6 +228,7 @@ fun EditScreen(
 private fun Header(
     store: LuxStore,
     refs: Int,
+    matchScore: Float?,
     canUndo: Boolean,
     canRedo: Boolean,
     atPresetName: String?,
@@ -239,12 +271,26 @@ private fun Header(
                 modifier = Modifier.weight(1f),
             )
         } else {
-            Text(
-                text = "luxbuilder · $refs REF${if (refs != 1) "S" else ""}",
-                style = Lux.type.labelMono,
-                color = colors.textTertiary,
-                modifier = Modifier.weight(1f),
-            )
+            Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                if (matchScore != null) {
+                    val n = matchScore.toInt()
+                    Text(
+                        text = "MATCH $n",
+                        style = Lux.type.labelMono,
+                        color = if (n >= 80) colors.accent else colors.textSecondary,
+                    )
+                    Text(
+                        text = " · ",
+                        style = Lux.type.labelMono,
+                        color = colors.textTertiary,
+                    )
+                }
+                Text(
+                    text = "luxbuilder · $refs REF${if (refs != 1) "S" else ""}",
+                    style = Lux.type.labelMono,
+                    color = colors.textTertiary,
+                )
+            }
         }
         HeaderChip(label = "↶", enabled = canUndo) { store.dispatch(LuxIntent.Undo) }
         Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xxs))
@@ -295,7 +341,7 @@ private fun HeaderChip(label: String, enabled: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun PreviewModeRow(showGraded: Boolean, onSelect: (Boolean) -> Unit) {
+private fun PreviewModeRow(mode: PreviewMode, onSelect: (PreviewMode) -> Unit) {
     val colors = Lux.colors
     Row(
         modifier = Modifier
@@ -309,12 +355,14 @@ private fun PreviewModeRow(showGraded: Boolean, onSelect: (Boolean) -> Unit) {
             color = colors.textTertiary,
         )
         Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xs))
-        ChipMini(label = "ORIGINAL", active = !showGraded, onClick = { onSelect(false) })
+        ChipMini(label = "ORIG", active = mode == PreviewMode.ORIGINAL, onClick = { onSelect(PreviewMode.ORIGINAL) })
         Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xxs))
-        ChipMini(label = "LUT", active = showGraded, onClick = { onSelect(true) })
+        ChipMini(label = "LUT", active = mode == PreviewMode.GRADED, onClick = { onSelect(PreviewMode.GRADED) })
+        Spacer(modifier = Modifier.padding(horizontal = LuxSpacing.xxs))
+        ChipMini(label = "SPLIT", active = mode == PreviewMode.SPLIT, onClick = { onSelect(PreviewMode.SPLIT) })
         Spacer(modifier = Modifier.weight(1f))
         Text(
-            text = "DRAG ⇄ TO COMPARE",
+            text = if (mode == PreviewMode.SPLIT) "DRAG TO ADJUST" else "DRAG ⇄ TO COMPARE",
             style = Lux.type.numMicro,
             color = colors.textTertiary,
         )

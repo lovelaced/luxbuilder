@@ -16,6 +16,8 @@ exifinterface = "1.4.2"
 coroutines = "1.10.2"
 desugar = "2.1.5"
 
+junit = "4.13.2"
+
 [libraries]
 compose-bom                  = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 compose-ui                   = { group = "androidx.compose.ui", name = "ui" }
@@ -39,6 +41,8 @@ androidx-exifinterface             = { group = "androidx.exifinterface", name = 
 kotlinx-coroutines-android   = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
 
 desugar-jdk-libs             = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugar" }
+
+junit                        = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -2,8 +2,6 @@ package app.luxbuilder.ui.components
 
 import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
@@ -17,11 +15,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -36,32 +32,37 @@ import app.luxbuilder.gpu.PipelineShader
 import app.luxbuilder.gpu.ShaderUniforms
 import app.luxbuilder.state.LuxState
 import app.luxbuilder.ui.theme.Lux
-import app.luxbuilder.ui.theme.LuxMotion
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+
+/**
+ * Three resting states for the preview. SPLIT persists indefinitely so the
+ * user can tune the grade against a frozen comparison position.
+ */
+enum class PreviewMode { ORIGINAL, GRADED, SPLIT }
 
 /**
  * Live preview surface.
  *
- * The *resting* state — what the user sees when no gesture is active —
- * depends on [showGraded]. References default to `false` (original photo
- * displayed untouched; LUT was derived from this so applying it would
- * exaggerate the look). User-picked photos default to `true` (LUT is the
- * point of viewing them).
+ * Resting state is driven entirely by [mode]:
+ *  - `ORIGINAL` — show the photo untouched.
+ *  - `GRADED`   — show the photo with the live AGSL pipeline applied.
+ *  - `SPLIT`    — show original on the left half and graded on the right,
+ *                 with a thin amber hairline marking the boundary. The split
+ *                 position persists at the last drag position (or 0.5 if the
+ *                 user hasn't dragged since entering SPLIT).
  *
- * Gestures, regardless of [showGraded]:
- *  - **Horizontal pan** on the photo: A/B split. The left half always
- *    shows original, the right half always shows LUT-applied — this is
- *    the universal before/after convention. On release the split line
- *    lingers 1.5 s then fades over 600 ms.
- *  - **Triple-tap** anywhere on the surface: toggle the histogram overlay.
+ * Gestures:
+ *  - **Horizontal pan** anywhere on the photo: enters SPLIT mode (via
+ *    [onUserDrag]) and sets the split position to the touch point. The
+ *    split stays put when the finger lifts — clear it by selecting
+ *    `ORIGINAL` or `GRADED` from the segmented control above.
+ *  - **Triple-tap** anywhere on the surface: toggle histogram overlay.
  */
 @Composable
 fun PreviewSurface(
     bitmap: android.graphics.Bitmap?,
     state: LuxState,
-    showGraded: Boolean,
+    mode: PreviewMode,
+    onUserDrag: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = Lux.colors
@@ -78,11 +79,20 @@ fun PreviewSurface(
     var showHistogram by remember { mutableStateOf(false) }
     val imageBitmap: ImageBitmap? = remember(bitmap) { bitmap?.asImageBitmap() }
 
-    // A/B split state
+    // splitX is the user's last drag position (0..1). Persists across drag end.
+    // When the caller flips mode away from SPLIT, we clear it so re-entering
+    // SPLIT later doesn't snap back to a stale position.
     var splitX by remember { mutableStateOf<Float?>(null) }
-    val splitAlpha = remember { Animatable(1f) }
-    val scope = rememberCoroutineScope()
-    var lingerJob by remember { mutableStateOf<Job?>(null) }
+    LaunchedEffect(mode) {
+        if (mode != PreviewMode.SPLIT) splitX = null
+    }
+
+    // The fraction actually drawn this frame. Defaults to 0.5 the first time
+    // the user enters SPLIT without having dragged yet.
+    val effectiveSplit: Float? = when (mode) {
+        PreviewMode.SPLIT -> splitX ?: 0.5f
+        else -> null
+    }
 
     Box(
         modifier = modifier
@@ -121,35 +131,18 @@ fun PreviewSurface(
                     .pointerInput(Unit) {
                         detectHorizontalDragGestures(
                             onDragStart = { start ->
-                                lingerJob?.cancel()
-                                scope.launch { splitAlpha.snapTo(1f) }
+                                onUserDrag()
                                 splitX = (start.x / size.width).coerceIn(0f, 1f)
                             },
                             onHorizontalDrag = { change, _ ->
                                 change.consume()
                                 splitX = (change.position.x / size.width).coerceIn(0f, 1f)
                             },
-                            onDragEnd = {
-                                lingerJob = scope.launch {
-                                    delay(LuxMotion.DurAbLinger.toLong())
-                                    splitAlpha.animateTo(
-                                        0f,
-                                        animationSpec = tween(
-                                            durationMillis = 600,
-                                            easing = LuxMotion.EaseAmberFade,
-                                        ),
-                                    )
-                                    splitX = null
-                                    splitAlpha.snapTo(1f)
-                                }
-                            },
-                            onDragCancel = { splitX = null },
+                            // No onDragEnd handling — splitX persists deliberately.
                         )
                     },
             ) {
-                val currentSplit = splitX
-
-                if (currentSplit == null) {
+                if (effectiveSplit == null) {
                     // Resting state — render exactly one layer
                     Image(
                         bitmap = imageBitmap,
@@ -157,13 +150,14 @@ fun PreviewSurface(
                         modifier = Modifier
                             .fillMaxSize()
                             .let { m ->
-                                if (showGraded) m.graphicsLayer { this.renderEffect = renderEffect }
-                                else m
+                                if (mode == PreviewMode.GRADED) {
+                                    m.graphicsLayer { this.renderEffect = renderEffect }
+                                } else m
                             },
                         contentScale = ContentScale.Fit,
                     )
                 } else {
-                    // Split state — original on left, graded on right (universal A/B convention)
+                    // Split — original on left, graded on right (universal A/B convention)
                     Image(
                         bitmap = imageBitmap,
                         contentDescription = null,
@@ -177,20 +171,18 @@ fun PreviewSurface(
                             .fillMaxSize()
                             .graphicsLayer { this.renderEffect = renderEffect }
                             .drawWithContent {
-                                val sx = currentSplit * size.width
+                                val sx = effectiveSplit * size.width
                                 clipRect(left = sx, top = 0f, right = size.width, bottom = size.height) {
                                     this@drawWithContent.drawContent()
                                 }
                             },
                         contentScale = ContentScale.Fit,
                     )
-                    // The split line — 1.5px amber
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .alpha(splitAlpha.value)
                             .drawWithContent {
-                                val sx = currentSplit * size.width
+                                val sx = effectiveSplit * size.width
                                 drawLine(
                                     color = Color(0xFFE8B23A),
                                     start = Offset(sx, 0f),

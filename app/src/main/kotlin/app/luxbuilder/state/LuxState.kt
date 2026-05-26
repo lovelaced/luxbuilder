@@ -118,11 +118,30 @@ data class LuxState(
     val wb: WhiteBalance = WhiteBalance(),
     val basics: Basics = Basics(),
 
-    // Color-match stage — sits between WB and LGG when active. The 3×3 matrix
-    // and bias are computed from references; mklStrength fades the effect in.
+    // ── Legacy 3×3 MKL in linear sRGB (v1.0–v1.2). Kept for persisted-preset
+    // ── back-compat; the v1.3 cascade uses the chroma-only fields below.
     val mklMatrix: FloatArray = floatArrayOf(1f, 0f, 0f,  0f, 1f, 0f,  0f, 0f, 1f),
     val mklBias:   FloatArray = floatArrayOf(0f, 0f, 0f),
     val mklStrength: Float = 0f,   // 0 = bypass, 1 = full
+
+    // ── v1.3 chroma-only MKL on OKLab (a, b). 2×2 matrix + 2-vector bias.
+    val mklChromaMatrix: FloatArray = floatArrayOf(1f, 0f, 0f, 1f),
+    val mklChromaBias:   FloatArray = floatArrayOf(0f, 0f),
+
+    // ── v1.3 HQ-mode residual: a 33³ × 3 additive OKLab correction baked
+    // ── by IDT + Ferradans smoothing. Null when HQ mode is off or not yet
+    // ── computed. Stored on state for atomic undo of the whole match.
+    val extractedHqResidual: FloatArray? = null,
+
+    // ── v1.3 user preferences (persisted separately via UserPrefs, mirrored
+    // ── here for fast access in extractors / shader bindings).
+    val stripShootingWb:  Boolean = true,
+    val highQualityMatch: Boolean = false,
+
+    // ── v1.3 computed quality metric, surfaced as MATCH badge in header.
+    // ── Transient — never recorded in undo history. 0..100 or null when no
+    // ── references are loaded.
+    val matchScore: Float? = null,
 
     val references: List<RefPhoto> = emptyList(),
     val presets: List<Preset> = emptyList(),
@@ -160,6 +179,13 @@ data class LuxState(
             mklMatrix.contentEquals(other.mklMatrix) &&
             mklBias.contentEquals(other.mklBias) &&
             mklStrength == other.mklStrength &&
+            mklChromaMatrix.contentEquals(other.mklChromaMatrix) &&
+            mklChromaBias.contentEquals(other.mklChromaBias) &&
+            (extractedHqResidual?.contentEquals(other.extractedHqResidual) ?:
+                (other.extractedHqResidual == null)) &&
+            stripShootingWb == other.stripShootingWb &&
+            highQualityMatch == other.highQualityMatch &&
+            matchScore == other.matchScore &&
             references == other.references && presets == other.presets &&
             activePresetId == other.activePresetId
     }
@@ -173,6 +199,12 @@ data class LuxState(
         h = 31 * h + mklMatrix.contentHashCode()
         h = 31 * h + mklBias.contentHashCode()
         h = 31 * h + mklStrength.hashCode()
+        h = 31 * h + mklChromaMatrix.contentHashCode()
+        h = 31 * h + mklChromaBias.contentHashCode()
+        h = 31 * h + (extractedHqResidual?.contentHashCode() ?: 0)
+        h = 31 * h + stripShootingWb.hashCode()
+        h = 31 * h + highQualityMatch.hashCode()
+        h = 31 * h + (matchScore?.hashCode() ?: 0)
         h = 31 * h + references.hashCode()
         h = 31 * h + presets.hashCode()
         h = 31 * h + (activePresetId?.hashCode() ?: 0)

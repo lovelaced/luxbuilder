@@ -16,8 +16,8 @@ android {
         applicationId = "app.luxbuilder"
         minSdk = 33                       // RuntimeShader + typed parcelable + PickVisualMedia
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 130
+        versionName = "1.3.0"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -27,6 +27,16 @@ android {
     sourceSets {
         getByName("main") {
             kotlin.srcDirs("src/main/kotlin")
+        }
+        getByName("test") {
+            kotlin.srcDirs("src/test/kotlin")
+        }
+    }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = false
+            isReturnDefaultValues = true
         }
     }
 
@@ -106,4 +116,6 @@ dependencies {
     implementation(libs.androidx.exifinterface)
 
     implementation(libs.kotlinx.coroutines.android)
+
+    testImplementation(libs.junit)
 }

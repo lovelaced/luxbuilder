@@ -26,6 +26,7 @@ object LutExporter {
     enum class Format(val ext: String, val mime: String) {
         CUBE("cube", "application/octet-stream"),
         VLT ("vlt",  "application/octet-stream"),
+        CDL ("cdl",  "application/xml"),
     }
 
     enum class Destination { SAF_FOLDER, SHARE_SHEET }
@@ -49,9 +50,9 @@ object LutExporter {
 
         when (destination) {
             Destination.SHARE_SHEET -> {
-                if (format != Format.CUBE) {
+                if (format == Format.VLT) {
                     return@withContext Result.Failed(
-                        "Lumix Lab only accepts .cube via share-sheet — .vlt must save to a folder for SD card copy."
+                        "`.vlt` must save to a folder for SD-card copy — share-sheet not supported."
                     )
                 }
                 val cacheFile = writeCacheFile(context, safeName, bytes)
@@ -80,19 +81,25 @@ object LutExporter {
         }
     }
 
-    /** Bake the LUT at the right grid size for the chosen format. */
+    /**
+     * Bake the chosen format. `.cube`/`.vlt` use the 65³ supersample + ACES
+     * 1.3 RGC + integer-decimate path so both come from the same master.
+     * `.cdl` is a parametric primary-only export (no bake needed).
+     */
     fun bake(state: LuxState, format: Format): ByteArray {
         return when (format) {
-            Format.CUBE -> CubeWriter.write(LutBaker.bake(state, 33), title = null)
-            Format.VLT  -> VltWriter.write(LutBaker.bake(state, 17))
+            Format.CUBE -> CubeWriter.write(LutBaker.bakeSupersampled(state, 33), title = null)
+            Format.VLT  -> VltWriter.write(LutBaker.bakeSupersampled(state, 17))
+            Format.CDL  -> CdlWriter.write(state)
         }
     }
 
     private fun sanitizeFilename(input: String, format: Format): String {
         val base = when (format) {
             Format.VLT -> VltWriter.sanitizeFilename(input)
-            Format.CUBE -> input.filter { it.isLetterOrDigit() || it == '_' || it == '-' }
-                .take(32).ifBlank { "lut" }
+            Format.CUBE, Format.CDL ->
+                input.filter { it.isLetterOrDigit() || it == '_' || it == '-' }
+                    .take(32).ifBlank { "lut" }
         }
         return "$base.${format.ext}"
     }

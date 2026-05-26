@@ -39,8 +39,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import app.luxbuilder.color.FerradansSmoother
+import app.luxbuilder.color.HueBandExtractor
+import app.luxbuilder.color.Idt
+import app.luxbuilder.color.MatchScore
 import app.luxbuilder.color.Mkl
 import app.luxbuilder.color.NaturalImagePrior
+import app.luxbuilder.color.RobustAggregator
+import app.luxbuilder.color.SyntheticSource
+import app.luxbuilder.color.ToneExtractor
 import app.luxbuilder.io.LutExporter
 import app.luxbuilder.io.SafFolder
 import app.luxbuilder.photo.PhotoSource
@@ -100,11 +107,21 @@ private fun AppRoot(store: LuxStore) {
         if (saved.isNotEmpty()) {
             store.dispatch(LuxIntent.SetPresetList(saved), recordInHistory = false)
         }
+        val savedWb = prefs.stripShootingWb.first()
+        store.dispatch(LuxIntent.SetStripShootingWb(savedWb), recordInHistory = false)
+        val savedHq = prefs.highQualityMatch.first()
+        store.dispatch(LuxIntent.SetHighQualityMatch(savedHq), recordInHistory = false)
         hydrated = true
     }
     // Persist on any change to the preset list (only after hydration completes)
     LaunchedEffect(state.presets, hydrated) {
         if (hydrated) prefs.savePresets(state.presets)
+    }
+    LaunchedEffect(state.stripShootingWb, hydrated) {
+        if (hydrated) prefs.setStripShootingWb(state.stripShootingWb)
+    }
+    LaunchedEffect(state.highQualityMatch, hydrated) {
+        if (hydrated) prefs.setHighQualityMatch(state.highQualityMatch)
     }
 
     // Multi-pick references — the primary input flow
@@ -127,25 +144,118 @@ private fun AppRoot(store: LuxStore) {
         bitmap = if (uri != null) PhotoSource.decodePreview(context, uri) else null
     }
 
-    // Color-match: refit MKL transform whenever references change
-    LaunchedEffect(state.references) {
+    // v1.3 auto-fit cascade. Re-runs whenever references change OR either
+    // toggle flips. Heavy work happens on Dispatchers.Default inside
+    // PhotoStats / extractors. Debounced 400ms to avoid thrashing while the
+    // user rapidly toggles or adds/removes refs.
+    LaunchedEffect(state.references, state.stripShootingWb, state.highQualityMatch) {
         val refUris = state.references.map { it.uri }
         if (refUris.isEmpty()) {
             store.dispatch(LuxIntent.ResetMkl, recordInHistory = false)
+            store.dispatch(LuxIntent.SetMatchScore(null), recordInHistory = false)
             return@LaunchedEffect
         }
         kotlinx.coroutines.delay(400)
-        val tgt = PhotoStats.compute(context, refUris) ?: return@LaunchedEffect
-        val transform = Mkl.solve(
-            muSrc = NaturalImagePrior.MU,
-            sigmaSrc = NaturalImagePrior.SIGMA,
-            muTgt = tgt.mu,
-            sigmaTgt = tgt.sigma,
+
+        // 1) Per-ref OKLab statistics (with optional WB-strip via Shades-of-Gray)
+        val perRef = PhotoStats.computePerRef(context, refUris, state.stripShootingWb)
+        if (perRef.isEmpty()) return@LaunchedEffect
+
+        // 2) Robust multi-reference aggregation
+        val agg = RobustAggregator.aggregate(perRef) ?: return@LaunchedEffect
+
+        // 3) Tone curve extraction on OKLab L
+        val tone = ToneExtractor.extract(
+            perRef = perRef,
+            sourceMuL = NaturalImagePrior.MU_OKLAB[0],
+            sourceVarL = NaturalImagePrior.SIGMA_OKLAB[0][0],
         )
-        store.dispatch(LuxIntent.SetMklTransform(transform.matrix, transform.bias), recordInHistory = false)
-        if (state.mklStrength == 0f) {
-            store.dispatch(LuxIntent.SetMklStrength(1f), recordInHistory = false)
-        }
+
+        // 4) Chroma-only MKL on (a, b)
+        val srcAb = floatArrayOf(NaturalImagePrior.MU_OKLAB[1], NaturalImagePrior.MU_OKLAB[2])
+        val srcAbSigma = floatArrayOf(
+            NaturalImagePrior.SIGMA_OKLAB[1][1], NaturalImagePrior.SIGMA_OKLAB[1][2],
+            NaturalImagePrior.SIGMA_OKLAB[2][1], NaturalImagePrior.SIGMA_OKLAB[2][2],
+        )
+        val tgtAb = floatArrayOf(agg.mu[1], agg.mu[2])
+        val tgtAbSigma = floatArrayOf(
+            agg.sigma[1][1], agg.sigma[1][2],
+            agg.sigma[2][1], agg.sigma[2][2],
+        )
+        val chromaT = Mkl.solveChroma(
+            muSrc_ab    = srcAb,
+            sigmaSrc_ab = srcAbSigma,
+            muTgt_ab    = tgtAb,
+            sigmaTgt_ab = tgtAbSigma,
+            nTarget     = perRef.sumOf { it.count },
+        )
+
+        // 5) Hue-band residual decomposition
+        //    Compare synthetic source-after-chroma-MKL against target pixels.
+        val syntheticSrc = SyntheticSource.sample(
+            n = 20_000,
+            mu = NaturalImagePrior.MU_OKLAB,
+            sigma = NaturalImagePrior.SIGMA_OKLAB,
+        )
+        val srcAfterChroma = SyntheticSource.applyChroma(
+            samples = syntheticSrc,
+            chromaMatrix = chromaT.matrix,
+            chromaBias = chromaT.bias,
+            sourceAbMean = srcAb,
+        )
+        // Pool a sample of target pixels across all refs (cap ~50k total).
+        val tgtPool = poolLabSamples(perRef, max = 50_000)
+        val hsl = HueBandExtractor.extract(
+            tgtLabSamples = tgtPool,
+            srcLabSamples = srcAfterChroma,
+        ).panel
+
+        // 6) HQ residual — only when state.highQualityMatch is on.
+        //    MKL+tone+HSL handle most of the look; IDT captures the non-
+        //    Gaussian residual (skew, multimodality, clipped highlights) as
+        //    an additive OKLab Δ that applies after the chroma stage.
+        val hqResidual: FloatArray? = if (state.highQualityMatch) {
+            val idtMaps = Idt.fit(
+                source = srcAfterChroma,
+                target = tgtPool,
+                iters = 8,
+            )
+            val residual = Idt.bakeResidual(
+                maps = idtMaps,
+                gridSize = 33,
+                chromaMatrix = chromaT.matrix,
+                chromaBias   = chromaT.bias,
+                sourceAbMean = srcAb,
+            )
+            FerradansSmoother.smoothGrid(residual, gridSize = 33)
+            residual
+        } else null
+
+        // 7) Atomic application — not recorded in undo history; the
+        //    reference/toggle change that triggered this cascade IS the
+        //    undo unit.
+        store.dispatch(
+            LuxIntent.ApplyExtractedLook(
+                toneLuma     = tone.toChannel(),
+                hsl          = hsl,
+                chromaMatrix = chromaT.matrix,
+                chromaBias   = chromaT.bias,
+                hqResidual   = hqResidual,
+            ),
+            recordInHistory = false,
+        )
+
+        // 8) MatchScore — Bures-Wasserstein on (post-chroma source) vs target
+        //    Gaussians in OKLab. Closed-form, microseconds.
+        val score = MatchScore.compute(
+            srcMu = NaturalImagePrior.MU_OKLAB,
+            srcSigma = NaturalImagePrior.SIGMA_OKLAB,
+            chromaT = chromaT,
+            srcAbMean = srcAb,
+            tgtMu = agg.mu,
+            tgtSigma = agg.sigma,
+        )
+        store.dispatch(LuxIntent.SetMatchScore(score), recordInHistory = false)
     }
 
     // Sheets
@@ -256,6 +366,38 @@ private fun displayPath(uri: android.net.Uri, filename: String): String {
     // just the filename — that's all the photographer actually needs to confirm.
     return filename
 }
+
+/**
+ * Pool OKLab pixel samples across per-ref stats with equal per-image weighting
+ * (each ref contributes ≤ max/N pixels, regardless of its individual sample
+ * count). Returns interleaved (L, a, b, …).
+ */
+private fun poolLabSamples(
+    perRef: List<app.luxbuilder.photo.PhotoStats.RefStat>,
+    max: Int,
+): FloatArray {
+    if (perRef.isEmpty()) return FloatArray(0)
+    val perImage = max / perRef.size
+    val out = FloatArray(perRef.size * perImage * 3)
+    var offset = 0
+    for (rs in perRef) {
+        val available = rs.count
+        val take = minOf(available, perImage)
+        // Take a stride through the per-ref labSamples for uniform coverage
+        val stride = (available / take).coerceAtLeast(1)
+        var src = 0
+        repeat(take) {
+            out[offset]     = rs.labSamples[src * 3]
+            out[offset + 1] = rs.labSamples[src * 3 + 1]
+            out[offset + 2] = rs.labSamples[src * 3 + 2]
+            offset += 3
+            src += stride
+        }
+    }
+    // If some refs had fewer samples, trim the buffer
+    return if (offset < out.size) out.copyOf(offset) else out
+}
+
 
 /**
  * Empty / cold-launch state — moodboard-first. CTA opens the multi-image

@@ -10,32 +10,42 @@ import app.luxbuilder.state.ToneCurves
 import app.luxbuilder.state.WhiteBalance
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * The full grading pipeline as pure Kotlin functions.
  *
- * Pipeline order (sRGB-encoded input → sRGB-encoded output):
- *   1. White balance      (linearize → von-Kries gain → re-encode)
- *   2. MKL color-match    (3×3 matrix + bias on linear-RGB, weighted by strength)
- *   3. Exposure / contrast (sRGB-encoded around midpoint)
- *   4. LGG: lift → gamma → gain  (ASC CDL slope/offset/power, per-channel)
- *   5. Tone curve         (master luma + per-channel)
- *   6. HSL six-color      (HSV decomposition, hue-windowed)
- *   7. Saturation, vibrance
+ * v1.3 pipeline order (sRGB-encoded in → sRGB-encoded out):
+ *   1. White balance      (linear sRGB von-Kries gains)
+ *   2. Contrast           (around midpoint, sRGB-encoded)
+ *   3. LGG                (lift → gamma → gain, ASC CDL slope/offset/power)
+ *   4. Per-channel R/G/B tone curves   (sRGB-encoded; intentional casts)
+ *   5. ─── OKLab cascade (auto-extracted look) ───
+ *      a. sRGB → linear sRGB → OKLab
+ *      b. Chroma MKL on (a, b) — 2×2 matrix + 2-vector bias
+ *      c. Master luma curve on OKLab L
+ *      d. Hue-band shifts in OKLCh — 6 bands × (Δh, log Δs, ΔL)
+ *      e. HQ-mode residual (if present)
+ *      f. OKLab → linear sRGB
+ *   6. Saturation, vibrance   (sRGB-encoded)
  *
- * Designed to mirror the AGSL fragment shader in [app.luxbuilder.gpu.PipelineShader].
- * Used directly by [LutBaker] to sample the pipeline at neutral grid points for
- * .cube / .vlt export, and by host-side validation runners.
+ * Must mirror [app.luxbuilder.gpu.PipelineShader] exactly — bake matches
+ * preview to 1e-4 on identity-state test cases.
  */
 object ColorPipeline {
 
     /**
-     * Precomputed lookup tables, one per state. Use this when applying the
-     * pipeline to many pixels — building the 1D curve tables and the LGG
-     * exponents once per state is much cheaper than per-pixel.
+     * Precomputed lookup tables, one per state. Building the 1D curve tables
+     * and the LGG exponents once per state is much cheaper than per-pixel,
+     * especially during the 65³ supersample bake.
      */
     class Tables(
         val tone: ToneTables,
@@ -45,9 +55,11 @@ object ColorPipeline {
         val hsl: HslPanel,
         val wb: WhiteBalance,
         val basics: Basics,
-        val mklMatrix: FloatArray,
-        val mklBias: FloatArray,
+        val mklChromaMatrix: FloatArray,   // 4 floats (2×2 row-major)
+        val mklChromaBias: FloatArray,     // 2 floats
         val mklStrength: Float,
+        val hqResidual: FloatArray?,       // 33³ × 3 OKLab Δ, or null
+        val hqResidualSize: Int,           // 0 when residual is null
     )
 
     class ToneTables(
@@ -57,43 +69,42 @@ object ColorPipeline {
         val blue: FloatArray,
     )
 
-    fun buildTables(state: LuxState): Tables = Tables(
-        tone = ToneTables(
-            luma = ToneCurve.sample(state.tone.luma),
-            red = ToneCurve.sample(state.tone.red),
-            green = ToneCurve.sample(state.tone.green),
-            blue = ToneCurve.sample(state.tone.blue),
-        ),
-        lggLift = state.lgg.lift, lggGamma = state.lgg.gamma, lggGain = state.lgg.gain,
-        hsl = state.hsl, wb = state.wb, basics = state.basics,
-        mklMatrix = state.mklMatrix, mklBias = state.mklBias, mklStrength = state.mklStrength,
-    )
+    fun buildTables(state: LuxState): Tables {
+        val residual = state.extractedHqResidual
+        val residualSize = if (residual != null) {
+            // residual = N³ × 3 floats → N = cbrt(size / 3)
+            val n = Math.cbrt((residual.size / 3).toDouble()).toInt()
+            require(n * n * n * 3 == residual.size) { "HQ residual size not a perfect cube" }
+            n
+        } else 0
+        return Tables(
+            tone = ToneTables(
+                luma = ToneCurve.sample(state.tone.luma),
+                red = ToneCurve.sample(state.tone.red),
+                green = ToneCurve.sample(state.tone.green),
+                blue = ToneCurve.sample(state.tone.blue),
+            ),
+            lggLift = state.lgg.lift, lggGamma = state.lgg.gamma, lggGain = state.lgg.gain,
+            hsl = state.hsl, wb = state.wb, basics = state.basics,
+            mklChromaMatrix = state.mklChromaMatrix,
+            mklChromaBias = state.mklChromaBias,
+            mklStrength = state.mklStrength,
+            hqResidual = residual,
+            hqResidualSize = residualSize,
+        )
+    }
 
     /** Apply the full pipeline to a single normalized sRGB-encoded RGB triple. */
     fun apply(t: Tables, r: Float, g: Float, b: Float): FloatArray {
         var rr = r; var gg = g; var bb = b
 
-        // 1. White balance
+        // 1. White balance — multiplicative gains in linear sRGB
         if (!t.wb.isNeutral) {
             val rgb = applyWhiteBalance(rr, gg, bb, t.wb)
             rr = rgb[0]; gg = rgb[1]; bb = rgb[2]
         }
 
-        // 2. MKL color-match (linear-space matrix + bias, with strength fade)
-        if (t.mklStrength > 0f) {
-            val lr = srgbToLinear(rr); val lg = srgbToLinear(gg); val lb = srgbToLinear(bb)
-            val m = t.mklMatrix
-            val nr = m[0] * lr + m[1] * lg + m[2] * lb + t.mklBias[0]
-            val ng = m[3] * lr + m[4] * lg + m[5] * lb + t.mklBias[1]
-            val nb = m[6] * lr + m[7] * lg + m[8] * lb + t.mklBias[2]
-            val w = t.mklStrength
-            val xr = linearToSrgb(softClamp(lr * (1f - w) + nr * w))
-            val xg = linearToSrgb(softClamp(lg * (1f - w) + ng * w))
-            val xb = linearToSrgb(softClamp(lb * (1f - w) + nb * w))
-            rr = xr; gg = xg; bb = xb
-        }
-
-        // 3. Contrast (around midpoint, in sRGB-encoded)
+        // 2. Contrast around midpoint, sRGB-encoded
         if (t.basics.contrast != 0f) {
             val c = 1f + t.basics.contrast / 100f
             rr = (rr - 0.5f) * c + 0.5f
@@ -101,30 +112,82 @@ object ColorPipeline {
             bb = (bb - 0.5f) * c + 0.5f
         }
 
-        // 4. LGG — lift, gamma, gain (each applies per-channel ASC CDL)
-        val out1 = applyLgg(rr, gg, bb, t.lggLift)
-        val out2 = applyLgg(out1[0], out1[1], out1[2], t.lggGamma)
-        val out3 = applyLgg(out2[0], out2[1], out2[2], t.lggGain)
-        rr = out3[0]; gg = out3[1]; bb = out3[2]
+        // 3. LGG
+        val o1 = applyLgg(rr, gg, bb, t.lggLift)
+        val o2 = applyLgg(o1[0], o1[1], o1[2], t.lggGamma)
+        val o3 = applyLgg(o2[0], o2[1], o2[2], t.lggGain)
+        rr = o3[0]; gg = o3[1]; bb = o3[2]
 
-        // 5. Tone curves
-        if (!isIdentity(t.tone.luma)) {
-            val y = luma(rr, gg, bb)
-            val yNew = ToneCurve.apply(t.tone.luma, y.coerceIn(0f, 1f))
-            val dy = yNew - y
-            rr += dy; gg += dy; bb += dy
-        }
-        rr = ToneCurve.apply(t.tone.red, rr.coerceIn(0f, 1f))
+        // 4. Per-channel R/G/B tone curves (sRGB; intentional cast)
+        rr = ToneCurve.apply(t.tone.red,   rr.coerceIn(0f, 1f))
         gg = ToneCurve.apply(t.tone.green, gg.coerceIn(0f, 1f))
-        bb = ToneCurve.apply(t.tone.blue, bb.coerceIn(0f, 1f))
+        bb = ToneCurve.apply(t.tone.blue,  bb.coerceIn(0f, 1f))
 
-        // 6. HSL six-color
-        if (!t.hsl.isNeutral) {
-            val rgb = applyHsl(rr, gg, bb, t.hsl)
-            rr = rgb[0]; gg = rgb[1]; bb = rgb[2]
+        // 5. ─── OKLab cascade ───
+        val lin = floatArrayOf(srgbToLinear(rr), srgbToLinear(gg), srgbToLinear(bb))
+        val lab = OkLab.fromLinearSrgb(lin[0], lin[1], lin[2])
+        var L = lab[0]; var a = lab[1]; var bChr = lab[2]
+
+        // 5b. Chroma MKL on (a, b), mixed by mklStrength
+        if (t.mklStrength > 0f) {
+            val mat = t.mklChromaMatrix
+            val ma = mat[0] * a + mat[1] * bChr + t.mklChromaBias[0]
+            val mb = mat[2] * a + mat[3] * bChr + t.mklChromaBias[1]
+            val w = t.mklStrength
+            a    = a    * (1f - w) + ma * w
+            bChr = bChr * (1f - w) + mb * w
         }
 
-        // 7. Saturation + vibrance
+        // 5b'. HQ residual — applied right after chroma MKL since IDT was
+        //      fit on post-chroma-MKL source samples. Indexed by raw linear
+        //      sRGB cell coords (matches what bakeResidual walked).
+        if (t.hqResidual != null && t.hqResidualSize > 0) {
+            val linR = srgbToLinear(r.coerceIn(0f, 1f))
+            val linG = srgbToLinear(g.coerceIn(0f, 1f))
+            val linB = srgbToLinear(b.coerceIn(0f, 1f))
+            val res = sampleResidual(t.hqResidual, t.hqResidualSize, linR, linG, linB)
+            L    += res[0]
+            a    += res[1]
+            bChr += res[2]
+        }
+
+        // 5c. Master luma curve on OKLab L
+        if (!isIdentity(t.tone.luma)) {
+            L = ToneCurve.apply(t.tone.luma, L.coerceIn(0f, 1f))
+        }
+
+        // 5d. OKLCh hue-band shifts
+        val C = sqrt(a * a + bChr * bChr)
+        val h = atan2(bChr, a)
+        if (C > 1e-6f) {
+            var dh = 0f; var ds = 0f; var dl = 0f
+            for ((anchorColor, anchorH) in OKLAB_ANCHORS) {
+                val anchor = t.hsl.anchors[anchorColor] ?: continue
+                if (anchor.hueShift == 0f && anchor.satShift == 0f && anchor.lumaShift == 0f) continue
+                val rawD = h - anchorH
+                val wrapped = wrapPi(rawD)
+                val w0 = max(0f, 1f - abs(wrapped) / (PI.toFloat() / 3f))
+                val ww = w0 * w0
+                dh += anchor.hueShift  * (PI.toFloat() / 6f) * ww
+                ds += anchor.satShift  * SAT_LOG2 * ww
+                dl += anchor.lumaShift * LUMA_OKLAB_PER_SLIDER * ww
+            }
+            val chromaGate = (C / 0.02f).coerceIn(0f, 1f)
+            dh *= chromaGate; ds *= chromaGate; dl *= chromaGate
+            L += dl
+            val cNew = C * exp(ds)
+            val hNew = h + dh
+            a    = cNew * cos(hNew)
+            bChr = cNew * sin(hNew)
+        }
+
+        // 5e. OKLab → linear sRGB → sRGB
+        val outLin = OkLab.toLinearSrgb(L, a, bChr)
+        rr = linearToSrgb(outLin[0].coerceIn(0f, 1f))
+        gg = linearToSrgb(outLin[1].coerceIn(0f, 1f))
+        bb = linearToSrgb(outLin[2].coerceIn(0f, 1f))
+
+        // 6. Sat/vib
         if (t.basics.saturation != 0f || t.basics.vibrance != 0f) {
             val rgb = applySatVib(rr, gg, bb, t.basics)
             rr = rgb[0]; gg = rgb[1]; bb = rgb[2]
@@ -133,7 +196,50 @@ object ColorPipeline {
         return floatArrayOf(rr.coerceIn(0f, 1f), gg.coerceIn(0f, 1f), bb.coerceIn(0f, 1f))
     }
 
-    // ───────── stage implementations ─────────
+    // ───────── shader-matching constants ─────────
+    private val SAT_LOG2 = ln(2.0).toFloat()
+    private const val LUMA_OKLAB_PER_SLIDER = 0.1f
+
+    /** Match shader anchor angles exactly. */
+    private val OKLAB_ANCHORS: List<Pair<HslColor, Float>> = listOf(
+        HslColor.ORANGE to 0.5235987756f,  //  30° red-orange
+        HslColor.YELLOW to 1.5707963268f,  //  90° yellow
+        HslColor.GREEN  to 2.6179938780f,  // 150° green
+        HslColor.AQUA   to 3.6651914292f,  // 210° cyan/aqua
+        HslColor.BLUE   to 4.7123889804f,  // 270° blue
+        HslColor.RED    to 5.7595865316f,  // 330° magenta/red
+    )
+
+    private fun wrapPi(x: Float): Float {
+        var y = x
+        while (y >  PI) y = (y - 2 * PI).toFloat()
+        while (y <= -PI) y = (y + 2 * PI).toFloat()
+        return y
+    }
+
+    /** Trilinear sample of an N³×3 OKLab residual grid at linear sRGB coords. */
+    private fun sampleResidual(res: FloatArray, n: Int, r: Float, g: Float, b: Float): FloatArray {
+        val s = (n - 1).toFloat()
+        val rf = r * s; val gf = g * s; val bf = b * s
+        val ri = rf.toInt().coerceIn(0, n - 2); val ru = (rf - ri)
+        val gi = gf.toInt().coerceIn(0, n - 2); val gu = (gf - gi)
+        val bi = bf.toInt().coerceIn(0, n - 2); val bu = (bf - bi)
+        val out = FloatArray(3)
+        for (ch in 0..2) {
+            fun at(rr: Int, gg: Int, bbb: Int): Float =
+                res[((bbb * n + gg) * n + rr) * 3 + ch]
+            val c00 = at(ri, gi, bi) * (1 - ru) + at(ri + 1, gi, bi) * ru
+            val c01 = at(ri, gi, bi + 1) * (1 - ru) + at(ri + 1, gi, bi + 1) * ru
+            val c10 = at(ri, gi + 1, bi) * (1 - ru) + at(ri + 1, gi + 1, bi) * ru
+            val c11 = at(ri, gi + 1, bi + 1) * (1 - ru) + at(ri + 1, gi + 1, bi + 1) * ru
+            val c0 = c00 * (1 - gu) + c10 * gu
+            val c1 = c01 * (1 - gu) + c11 * gu
+            out[ch] = c0 * (1 - bu) + c1 * bu
+        }
+        return out
+    }
+
+    // ───────── individual stages ─────────
 
     /** ASC CDL: out = (in * slope + offset)^(1/power), per channel, sRGB-encoded space. */
     private fun applyLgg(r: Float, g: Float, b: Float, a: LggAxis): FloatArray {
@@ -153,18 +259,13 @@ object ColorPipeline {
     private fun applyWhiteBalance(r: Float, g: Float, b: Float, wb: WhiteBalance): FloatArray {
         val k = (6500 + wb.tempOffsetK).coerceIn(1000, 40000)
         val (kr, kg, kb) = kelvinToRgbGains(k)
-        // Linearize → apply gains → re-encode. Tint is a green/magenta shift on G.
         val lr = srgbToLinear(r) * kr
         var lg = srgbToLinear(g) * kg
         val lb = srgbToLinear(b) * kb
-        lg *= (1f - wb.tintOffset / 200f) // tintOffset -100..+100 maps to ±0.5
+        lg *= (1f - wb.tintOffset / 200f)
         return floatArrayOf(linearToSrgb(lr), linearToSrgb(lg), linearToSrgb(lb))
     }
 
-    /**
-     * Tanner Helland's Kelvin → RGB polynomial fit (clamped to typical phot range).
-     * Returns the gains relative to 6500K daylight (so 6500 gives (1,1,1)).
-     */
     private fun kelvinToRgbGains(k: Int): Triple<Float, Float, Float> {
         val target = kelvinToRgb(k.toDouble())
         val baseline = kelvinToRgb(6500.0)
@@ -192,46 +293,12 @@ object ColorPipeline {
         )
     }
 
-    /** Six-color HSL: per-anchor hue-windowed deltas in HSV space. */
-    private fun applyHsl(r: Float, g: Float, b: Float, panel: HslPanel): FloatArray {
-        val hsv = rgbToHsv(r, g, b)
-        var h = hsv[0]; var s = hsv[1]; var v = hsv[2]
-
-        // Each anchor's center hue (degrees) and ±60° smooth window
-        val anchors = listOf(
-            HslColor.RED    to 0f,
-            HslColor.ORANGE to 30f,
-            HslColor.YELLOW to 60f,
-            HslColor.GREEN  to 120f,
-            HslColor.AQUA   to 180f,
-            HslColor.BLUE   to 240f,
-        )
-        var hShift = 0f
-        var sScale = 1f
-        var vScale = 1f
-        for ((color, anchorH) in anchors) {
-            val a = panel.anchors[color] ?: continue
-            if (a.hueShift == 0f && a.satShift == 0f && a.lumaShift == 0f) continue
-            val d = hueDistance(h, anchorH)
-            val w = max(0f, 1f - d / 60f).let { it * it }    // smooth-squared falloff
-            hShift += w * a.hueShift * 30f                   // ±1 → ±30°
-            sScale *= 1f + w * a.satShift
-            vScale *= 1f + w * a.lumaShift
-        }
-        h = (h + hShift + 360f) % 360f
-        s = (s * sScale).coerceIn(0f, 1f)
-        v = (v * vScale).coerceIn(0f, 1f)
-        return hsvToRgb(h, s, v)
-    }
-
     private fun applySatVib(r: Float, g: Float, b: Float, basics: Basics): FloatArray {
         val y = luma(r, g, b)
-        // Saturation: simple luma-mix
         val sat = 1f + basics.saturation / 100f
         var rr = y + (r - y) * sat
         var gg = y + (g - y) * sat
         var bb = y + (b - y) * sat
-        // Vibrance: adaptive — boost less-saturated more
         if (basics.vibrance != 0f) {
             val maxC = max(rr, max(gg, bb))
             val minC = min(rr, min(gg, bb))
@@ -252,18 +319,10 @@ object ColorPipeline {
     fun linearToSrgb(x: Float): Float =
         if (x <= 0.0031308f) 12.92f * x else 1.055f * x.pow(1f / 2.4f) - 0.055f
 
-    /** Soft clamp via exponential rolloff near 1 (and mirror near 0). */
-    private fun softClamp(x: Float): Float = when {
-        x <= 0f -> 0f
-        x >= 1f -> 1f - (1f - 1f / (1f + (x - 1f) * 4f)) * 0.0001f   // tiny; just keeps it < 1
-        else -> x
-    }
-
     private fun luma(r: Float, g: Float, b: Float): Float =
         0.2126f * r + 0.7152f * g + 0.0722f * b
 
     private fun isIdentity(table: FloatArray): Boolean {
-        // table[i] should equal i / (size - 1) within fp tolerance
         val n = table.size
         for (i in arrayOf(0, n / 4, n / 2, 3 * n / 4, n - 1)) {
             val expected = i.toFloat() / (n - 1)
@@ -272,42 +331,5 @@ object ColorPipeline {
         return true
     }
 
-    private fun hueDistance(a: Float, b: Float): Float {
-        val d = abs(a - b) % 360f
-        return if (d > 180f) 360f - d else d
-    }
-
-    fun rgbToHsv(r: Float, g: Float, b: Float): FloatArray {
-        val mx = max(r, max(g, b))
-        val mn = min(r, min(g, b))
-        val d = mx - mn
-        val h = when {
-            d == 0f -> 0f
-            mx == r -> 60f * (((g - b) / d) % 6f)
-            mx == g -> 60f * (((b - r) / d) + 2f)
-            else    -> 60f * (((r - g) / d) + 4f)
-        }
-        val hh = (h + 360f) % 360f
-        val s = if (mx == 0f) 0f else d / mx
-        return floatArrayOf(hh, s, mx)
-    }
-
-    fun hsvToRgb(h: Float, s: Float, v: Float): FloatArray {
-        val c = v * s
-        val hp = h / 60f
-        val x = c * (1f - abs(hp % 2f - 1f))
-        val (r, g, b) = when (hp.toInt()) {
-            0 -> Triple(c, x, 0f)
-            1 -> Triple(x, c, 0f)
-            2 -> Triple(0f, c, x)
-            3 -> Triple(0f, x, c)
-            4 -> Triple(x, 0f, c)
-            else -> Triple(c, 0f, x)
-        }
-        val m = v - c
-        return floatArrayOf(r + m, g + m, b + m)
-    }
-
-    // Silence unused-import warning in some toolchains
     @Suppress("unused") private val PiUnused = PI
 }

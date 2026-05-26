@@ -90,6 +90,13 @@ fun ExportSheet(
                 selected = format == LutExporter.Format.VLT,
                 onSelect = { format = LutExporter.Format.VLT },
             )
+            Spacer(modifier = Modifier.height(LuxSpacing.xs))
+            FormatRow(
+                label = ".cdl",
+                description = "Editable intent · slope/offset/power · pairs with .cube",
+                selected = format == LutExporter.Format.CDL,
+                onSelect = { format = LutExporter.Format.CDL },
+            )
 
             Spacer(modifier = Modifier.height(LuxSpacing.xl))
 

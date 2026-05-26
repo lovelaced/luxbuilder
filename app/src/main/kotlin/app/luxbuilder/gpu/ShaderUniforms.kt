@@ -9,17 +9,22 @@ import app.luxbuilder.color.ColorPipeline
 import app.luxbuilder.color.ToneCurve
 import app.luxbuilder.state.HslAnchor
 import app.luxbuilder.state.HslColor
-import app.luxbuilder.state.HslPanel
 import app.luxbuilder.state.LggAxis
 import app.luxbuilder.state.LuxState
 import app.luxbuilder.state.WhiteBalance
+import kotlin.math.PI
+import kotlin.math.ln
 
 /**
  * Builds and binds uniforms on a [RuntimeShader] from the current [LuxState].
  *
- * The tone curve and Kelvin→RGB gains are precomputed on the host so the
- * shader stays pure-arithmetic; uniforms ship to the GPU via setFloatUniform
- * (and a single setInputShader for the curve bitmap).
+ * v1.3 changes:
+ *   - Replaced legacy 3×3 MKL uniforms (uMklRow0/1/2, uMklBias) with the
+ *     chroma-only pair (uMklChromaMat: vec4, uMklChromaBias: vec2).
+ *   - HSL anchors now pack OKLab-domain shifts (hueShiftRad, logSatScale,
+ *     lumaShift) instead of HSV-domain (hueShiftDeg, satScale, valScale).
+ *   - The tone-curve bitmap row 0 (master luma) is now sampled in OKLab L
+ *     space inside the shader, not as a sRGB-luma delta.
  */
 @RequiresApi(33)
 class ShaderUniforms(val shader: RuntimeShader) {
@@ -31,13 +36,11 @@ class ShaderUniforms(val shader: RuntimeShader) {
         val gains = computeWbGains(state.wb)
         shader.setFloatUniform("uWbGains", gains[0], gains[1], gains[2])
 
-        // 2. MKL
+        // 2. Chroma MKL (2×2 + 2-vector bias)
         shader.setFloatUniform("uMklStrength", state.mklStrength)
-        val m = state.mklMatrix
-        shader.setFloatUniform("uMklRow0", m[0], m[1], m[2])
-        shader.setFloatUniform("uMklRow1", m[3], m[4], m[5])
-        shader.setFloatUniform("uMklRow2", m[6], m[7], m[8])
-        shader.setFloatUniform("uMklBias", state.mklBias[0], state.mklBias[1], state.mklBias[2])
+        val m = state.mklChromaMatrix
+        shader.setFloatUniform("uMklChromaMat", m[0], m[1], m[2], m[3])
+        shader.setFloatUniform("uMklChromaBias", state.mklChromaBias[0], state.mklChromaBias[1])
 
         // 3. Contrast
         shader.setFloatUniform("uContrast", 1f + state.basics.contrast / 100f)
@@ -47,7 +50,9 @@ class ShaderUniforms(val shader: RuntimeShader) {
         bindLgg("uGamma", state.lgg.gamma)
         bindLgg("uGain",  state.lgg.gain)
 
-        // 5. Tone curves — all four channels packed into a 1024×4 RGBA bitmap
+        // 5. Tone curves — all four channels packed into a 1024×4 RGBA bitmap.
+        //    Row 0 (master luma) is now sampled in OKLab L space; rows 1-3
+        //    (per-channel R/G/B) stay in sRGB-encoded space.
         val toneTables = ColorPipeline.buildTables(state).tone
         val (bitmap, hasFlags) = buildCurveBitmap(
             toneTables.luma, toneTables.red, toneTables.green, toneTables.blue
@@ -56,7 +61,11 @@ class ShaderUniforms(val shader: RuntimeShader) {
         shader.setInputShader("toneCurve", BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP))
         shader.setFloatUniform("uHasCurve", hasFlags[0], hasFlags[1], hasFlags[2], hasFlags[3])
 
-        // 6. HSL anchors — pack as 6 vec3s (hueShiftDeg, satScale, valScale)
+        // 6. HSL anchors — pack in OKLab units: (hueShiftRad, logSatScale, lumaShift).
+        //    Slider ranges (−1..+1) calibrated to feel natural:
+        //      hueShift  ±1  → ±30° = ±π/6 rad
+        //      satShift  ±1  → ×½..×2  = ±ln 2
+        //      lumaShift ±1  → ±0.1 OKLab L
         bindHslAnchor("uHsl_red",    state.hsl.anchors[HslColor.RED]    ?: HslAnchor())
         bindHslAnchor("uHsl_orange", state.hsl.anchors[HslColor.ORANGE] ?: HslAnchor())
         bindHslAnchor("uHsl_yellow", state.hsl.anchors[HslColor.YELLOW] ?: HslAnchor())
@@ -75,39 +84,29 @@ class ShaderUniforms(val shader: RuntimeShader) {
         shader.setFloatUniform("${prefix}_power",  axis.powerR,  axis.powerG,  axis.powerB)
     }
 
+    private val hueSliderToRad = (PI.toFloat() / 6f)
+    private val satSliderToLog = ln(2.0).toFloat()
+    private val lumaSliderToOkLabL = 0.1f
+
     private fun bindHslAnchor(name: String, a: HslAnchor) {
-        // hueShiftDeg = ±30°, satScale = ±1 normalized, valScale = ±1 normalized.
-        // The shader treats y/z as additive scale-offsets (e.g. 0 = neutral, +1 = 2× sat).
-        shader.setFloatUniform(name, a.hueShift * 30f, a.satShift, a.lumaShift)
+        shader.setFloatUniform(
+            name,
+            a.hueShift  * hueSliderToRad,
+            a.satShift  * satSliderToLog,
+            a.lumaShift * lumaSliderToOkLabL,
+        )
     }
 
     private fun computeWbGains(wb: WhiteBalance): FloatArray {
         if (wb.isNeutral) return floatArrayOf(1f, 1f, 1f)
-        // Reuse the public Kelvin→RGB approximation by sampling at midgray.
-        // ColorPipeline.applyWhiteBalance does this in one shot; we extract the
-        // gains by applying it to a linearized 1.0 grey and reading back.
-        val mid = 0.5f
-        val out = floatArrayOf(mid, mid, mid)
-        // Use public sRGB helpers + the Kelvin gains routine indirectly:
-        // apply to a known linear-1 sample, then undo.
         val r = ColorPipeline.srgbToLinear(0.5f)
-        // We need the raw gains; reverse-engineer via a sample probe:
         val sampled = sampleProbe(wb)
-        out[0] = sampled[0] / r
-        out[1] = sampled[1] / r
-        out[2] = sampled[2] / r
-        return out
+        return floatArrayOf(sampled[0] / r, sampled[1] / r, sampled[2] / r)
     }
 
     private fun sampleProbe(wb: WhiteBalance): FloatArray {
-        // Apply the host pipeline's WB to a known linear sample and read the
-        // result back. This guarantees the shader uses bit-identical gains.
-        // Use a single midgray pixel; the gains are independent of value.
-        val pipe = ColorPipeline.buildTables(
-            app.luxbuilder.state.LuxState(wb = wb)
-        )
+        val pipe = ColorPipeline.buildTables(LuxState(wb = wb))
         val out = ColorPipeline.apply(pipe, 0.5f, 0.5f, 0.5f)
-        // Convert back to linear for use as gains
         return floatArrayOf(
             ColorPipeline.srgbToLinear(out[0]),
             ColorPipeline.srgbToLinear(out[1]),

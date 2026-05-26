@@ -46,6 +46,32 @@ fun reduce(state: LuxState, intent: LuxIntent): LuxState = when (intent) {
         mklMatrix = floatArrayOf(1f, 0f, 0f,  0f, 1f, 0f,  0f, 0f, 1f),
         mklBias = floatArrayOf(0f, 0f, 0f),
         mklStrength = 0f,
+        mklChromaMatrix = floatArrayOf(1f, 0f, 0f, 1f),
+        mklChromaBias = floatArrayOf(0f, 0f),
+        extractedHqResidual = null,
+        // Also reset the auto-extracted parts of the cascade
+        tone = state.tone.copy(luma = CurveChannel.Identity),
+        hsl = HslPanel(),
+    )
+
+    is LuxIntent.SetMklChroma       -> state.copy(
+        mklChromaMatrix = intent.matrix,
+        mklChromaBias = intent.bias,
+    )
+
+    is LuxIntent.SetStripShootingWb -> state.copy(stripShootingWb = intent.enabled)
+    is LuxIntent.SetHighQualityMatch -> state.copy(highQualityMatch = intent.enabled)
+    is LuxIntent.SetMatchScore       -> state.copy(matchScore = intent.score)
+
+    is LuxIntent.ApplyExtractedLook -> state.copy(
+        tone = state.tone.copy(luma = intent.toneLuma),
+        hsl = intent.hsl,
+        mklChromaMatrix = intent.chromaMatrix,
+        mklChromaBias = intent.chromaBias,
+        extractedHqResidual = intent.hqResidual,
+        // Auto-set mklStrength to 1.0 on first match (current v1.2 behavior).
+        // If the user has already dialed it down, respect their choice.
+        mklStrength = if (state.mklStrength == 0f) 1f else state.mklStrength,
     )
 
     is LuxIntent.SavePreset         -> state.copy(

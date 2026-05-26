@@ -8,37 +8,39 @@ package app.luxbuilder.gpu
  * pixel-identical to what [app.luxbuilder.color.LutBaker] exports.
  *
  * Pipeline order (sRGB-encoded in → sRGB-encoded out):
- *   1. White balance     (Kelvin gains precomputed on host, passed as vec3 in linear-RGB scale factors)
- *   2. MKL color-match   (3×3 + bias on linear-RGB, mixed by mklStrength)
- *   3. Contrast          (sRGB-encoded, around midpoint)
- *   4. LGG               (lift → gamma → gain; ASC CDL slope/offset/power)
- *   5. Tone curve        (master luma applied as luminance delta)
- *   6. HSL six-color     (RGB→HSV, hue-windowed deltas, HSV→RGB)
- *   7. Saturation / vibrance
+ *   1. White balance     (Kelvin gains in linear sRGB)
+ *   2. Contrast          (around midpoint, sRGB-encoded)
+ *   3. LGG               (lift → gamma → gain, ASC CDL per stage, sRGB)
+ *   4. Per-channel R/G/B tone curves   (sRGB-encoded; user-driven cast)
+ *   5. ─── OKLab cascade (auto-extracted look) ───
+ *      a. sRGB → linear sRGB → OKLab
+ *      b. Chroma MKL on (a, b) — 2×2 matrix + 2-vector bias
+ *      c. Master luma curve on OKLab L
+ *      d. Hue-band shifts in OKLCh — 6 bands × (Δh, Δs, ΔL)
+ *      e. OKLab → linear sRGB
+ *   6. Saturation / vibrance   (sRGB-encoded)
  *
- * Uniforms (set via PipelineShader.bind()):
- *   uniform shader composable           // the source preview image
- *   uniform shader toneCurve            // 1024×4 RGBA BitmapShader — rows: luma, R, G, B
- *   uniform float4  uHasCurve           // per-row enabled flag (luma, R, G, B)
+ * Uniforms (set via [ShaderUniforms.bind]):
+ *   shader composable               source preview image
+ *   shader toneCurve                1024×4 RGBA bitmap, rows: master-L, R, G, B
+ *   float4 uHasCurve                per-row enable flag (luma, R, G, B)
  *
- *   uniform float3  uWbGains            // per-channel multiplicative gains in linear sRGB
+ *   float3 uWbGains                 per-channel multiplicative gains in linear sRGB
  *
- *   uniform float   uMklStrength        // 0 = bypass, 1 = full
- *   uniform float3  uMklRow0, uMklRow1, uMklRow2   // 3×3 matrix rows
- *   uniform float3  uMklBias
+ *   float4 uMklChromaMat            row-major 2×2 chroma MKL  (m00,m01,m10,m11)
+ *   float2 uMklChromaBias           chroma MKL bias on (a, b)
+ *   float  uMklStrength             0 = bypass, 1 = full chroma MKL
  *
- *   uniform float   uContrast           // 1 = neutral; e.g. 1.2 = +20%
+ *   float  uContrast                1 = neutral, e.g. 1.2 = +20%
  *
- *   uniform float3  uLift_slope, uLift_offset, uLift_power
- *   uniform float3  uGamma_slope, uGamma_offset, uGamma_power
- *   uniform float3  uGain_slope, uGain_offset, uGain_power
+ *   float3 uLift_slope,  uLift_offset,  uLift_power
+ *   float3 uGamma_slope, uGamma_offset, uGamma_power
+ *   float3 uGain_slope,  uGain_offset,  uGain_power
  *
- *   uniform float3  uHsl_hue            // hue shifts per anchor (radians) — packed in 2 floats below
- *   // For simplicity v1 passes 6 vec3s for the 6 HSL anchors. Each anchor is (hueShiftDeg, satScale, valScale).
- *   uniform float3  uHsl_red, uHsl_orange, uHsl_yellow, uHsl_green, uHsl_aqua, uHsl_blue
+ *   // 6 OKLCh hue-band shifts in OKLab UNITS: (hueShiftRad, logSatScale, lumaShift)
+ *   float3 uHsl_red, uHsl_orange, uHsl_yellow, uHsl_green, uHsl_aqua, uHsl_blue
  *
- *   uniform float   uSaturation         // 1 = neutral
- *   uniform float   uVibrance           // 0 = neutral
+ *   float  uSaturation, uVibrance
  */
 object PipelineShader {
 
@@ -50,11 +52,9 @@ object PipelineShader {
 
         uniform float3 uWbGains;
 
+        uniform float4 uMklChromaMat;   // (m00, m01, m10, m11)
+        uniform float2 uMklChromaBias;  // (bias_a, bias_b)
         uniform float  uMklStrength;
-        uniform float3 uMklRow0;
-        uniform float3 uMklRow1;
-        uniform float3 uMklRow2;
-        uniform float3 uMklBias;
 
         uniform float  uContrast;
 
@@ -68,6 +68,7 @@ object PipelineShader {
         uniform float3 uGain_offset;
         uniform float3 uGain_power;
 
+        // Each anchor packs (hueShiftRad, logSatScale, lumaShift) in OKLab units.
         uniform float3 uHsl_red;
         uniform float3 uHsl_orange;
         uniform float3 uHsl_yellow;
@@ -90,50 +91,62 @@ object PipelineShader {
             return mix(lo, hi, step(0.0031308, c));
         }
 
+        // ───── OKLab (Ottosson 2020) ─────
+        float3 linearToOklab(float3 c) {
+            float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+            float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+            float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+            // Sign-preserving cube root
+            float l_ = sign(l) * pow(abs(l), 1.0/3.0);
+            float m_ = sign(m) * pow(abs(m), 1.0/3.0);
+            float s_ = sign(s) * pow(abs(s), 1.0/3.0);
+            return float3(
+                0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+                1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+                0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_);
+        }
+        float3 oklabToLinear(float3 lab) {
+            float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+            float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+            float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+            float l = l_ * l_ * l_;
+            float m = m_ * m_ * m_;
+            float s = s_ * s_ * s_;
+            return float3(
+                 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+                -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+                -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+        }
+
         // ───── ASC CDL — per-channel slope/offset/power ─────
         float3 cdl(float3 v, float3 slope, float3 offset, float3 power) {
             float3 t = max(v * slope + offset, float3(0.0));
             return pow(t, 1.0 / max(power, float3(1e-3)));
         }
 
-        // ───── HSV decomposition ─────
-        float3 rgb2hsv(float3 c) {
-            float4 K = float4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
-            float4 p = mix(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
-            float4 q = mix(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
-            float d = q.x - min(q.w, q.y);
-            float e = 1.0e-10;
-            return float3(abs(q.z + (q.w - q.y) / (6.0 * d + e)),
-                          d / (q.x + e),
-                          q.x);
-        }
-        float3 hsv2rgb(float3 c) {
-            float4 K = float4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
-            float3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-            return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-        }
-
-        float hueDistance(float a, float bDeg) {
-            // a in degrees, bDeg in degrees
-            float d = abs(a - bDeg);
-            d = mod(d, 360.0);
-            return min(d, 360.0 - d);
-        }
-
-        // For a single anchor with hueShiftDeg in [-30,+30], satScale, valScale.
-        // Returns accumulated (deltaHueDeg, satScaleMul, valScaleMul).
-        float3 applyAnchor(float hueDeg, float anchorH, float3 cfg) {
-            // cfg: x = hueShiftDeg (-30..+30), y = satShiftNorm (-1..+1 as scale offset), z = lumaShiftNorm
-            float d = hueDistance(hueDeg, anchorH);
-            float w = max(0.0, 1.0 - d / 60.0);
-            w = w * w;
-            return float3(cfg.x * w, 1.0 + cfg.y * w, 1.0 + cfg.z * w);
-        }
-
-        // Sample row `row` (0..3) of the 1024×4 RGBA curve bitmap. We read the
-        // red channel — all RGB channels are packed identically in each pixel.
+        // ───── Tone-curve LUT sampling ─────
+        // Sample row `row` (0..3) of the 1024×4 RGBA curve bitmap.
         float sampleCurveRow(float x, int row) {
             return toneCurve.eval(float2(clamp(x, 0.0, 1.0) * 1024.0, float(row) + 0.5)).r;
+        }
+
+        // ───── OKLCh hue-band shift ─────
+        // For one anchor at hue `anchorH` (radians) with cfg = (Δh, logΔsat, Δlum),
+        // returns weighted contributions accumulated into deltas.
+        // Triangular falloff w = max(0, 1 − |Δh|/(π/3))  (half-width = 60°).
+        float circDist(float a, float b) {
+            float d = a - b;
+            // Wrap into (-π, π]
+            d = mod(d + 3.14159265, 6.28318530) - 3.14159265;
+            return d;
+        }
+        float3 applyAnchor(float h, float anchorH, float3 cfg) {
+            float d = circDist(h, anchorH);
+            float ad = abs(d);
+            float w = max(0.0, 1.0 - ad / (3.14159265 / 3.0));
+            // Triangular squared for smoother roll-off — matches CPU extractor
+            w = w * w;
+            return float3(cfg.x * w, cfg.y * w, cfg.z * w);
         }
 
         half4 main(float2 coords) {
@@ -147,59 +160,69 @@ object PipelineShader {
                 rgb = linearToSrgb(clamp(lin, 0.0, 1.0));
             }
 
-            // 2. MKL color-match in linear-RGB, mixed by strength
-            if (uMklStrength > 0.0) {
-                float3 lin = srgbToLinear(rgb);
-                float3 mapped = float3(dot(uMklRow0, lin),
-                                       dot(uMklRow1, lin),
-                                       dot(uMklRow2, lin)) + uMklBias;
-                lin = mix(lin, mapped, uMklStrength);
-                rgb = linearToSrgb(clamp(lin, 0.0, 1.0));
-            }
-
-            // 3. Contrast around midpoint, in sRGB-encoded
+            // 2. Contrast around midpoint, sRGB-encoded
             if (uContrast != 1.0) {
                 rgb = (rgb - 0.5) * uContrast + 0.5;
             }
 
-            // 4. LGG: lift → gamma → gain (all in sRGB-encoded)
+            // 3. LGG — lift → gamma → gain
             rgb = cdl(rgb, uLift_slope,  uLift_offset,  uLift_power);
             rgb = cdl(rgb, uGamma_slope, uGamma_offset, uGamma_power);
             rgb = cdl(rgb, uGain_slope,  uGain_offset,  uGain_power);
 
-            // 5a. Master luma curve applied as luminance delta
-            if (uHasCurve.x > 0.5) {
-                float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
-                float yNew = sampleCurveRow(y, 0);
-                float dy = yNew - y;
-                rgb = rgb + float3(dy);
-            }
-            // 5b. Per-channel R/G/B curves applied directly
+            // 4. Per-channel R/G/B tone curves (sRGB; intentional casts)
             if (uHasCurve.y > 0.5) rgb.r = sampleCurveRow(clamp(rgb.r, 0.0, 1.0), 1);
             if (uHasCurve.z > 0.5) rgb.g = sampleCurveRow(clamp(rgb.g, 0.0, 1.0), 2);
             if (uHasCurve.w > 0.5) rgb.b = sampleCurveRow(clamp(rgb.b, 0.0, 1.0), 3);
 
-            // 6. HSL six-color
-            float3 hsv = rgb2hsv(clamp(rgb, 0.0, 1.0));
-            float hDeg = hsv.x * 360.0;
-            float hueShift = 0.0;
-            float satScale = 1.0;
-            float valScale = 1.0;
-            float3 acc;
-            acc = applyAnchor(hDeg,   0.0, uHsl_red);    hueShift += acc.x; satScale *= acc.y; valScale *= acc.z;
-            acc = applyAnchor(hDeg,  30.0, uHsl_orange); hueShift += acc.x; satScale *= acc.y; valScale *= acc.z;
-            acc = applyAnchor(hDeg,  60.0, uHsl_yellow); hueShift += acc.x; satScale *= acc.y; valScale *= acc.z;
-            acc = applyAnchor(hDeg, 120.0, uHsl_green);  hueShift += acc.x; satScale *= acc.y; valScale *= acc.z;
-            acc = applyAnchor(hDeg, 180.0, uHsl_aqua);   hueShift += acc.x; satScale *= acc.y; valScale *= acc.z;
-            acc = applyAnchor(hDeg, 240.0, uHsl_blue);   hueShift += acc.x; satScale *= acc.y; valScale *= acc.z;
-            if (hueShift != 0.0 || satScale != 1.0 || valScale != 1.0) {
-                hsv.x = fract((hDeg + hueShift) / 360.0 + 1.0);
-                hsv.y = clamp(hsv.y * satScale, 0.0, 1.0);
-                hsv.z = clamp(hsv.z * valScale, 0.0, 1.0);
-                rgb = hsv2rgb(hsv);
+            // 5. ─── OKLab cascade ───
+            float3 lin = srgbToLinear(clamp(rgb, 0.0, 1.0));
+            float3 lab = linearToOklab(lin);
+
+            //   5b. Chroma MKL on (a, b), mixed by uMklStrength
+            if (uMklStrength > 0.0) {
+                float2 ab = lab.yz;
+                float2 mapped = float2(
+                    uMklChromaMat.x * ab.x + uMklChromaMat.y * ab.y + uMklChromaBias.x,
+                    uMklChromaMat.z * ab.x + uMklChromaMat.w * ab.y + uMklChromaBias.y
+                );
+                lab.yz = mix(ab, mapped, uMklStrength);
             }
 
-            // 7. Saturation + vibrance
+            //   5c. Master luma curve on OKLab L
+            if (uHasCurve.x > 0.5) {
+                lab.x = sampleCurveRow(clamp(lab.x, 0.0, 1.0), 0);
+            }
+
+            //   5d. Hue-band shifts in OKLCh
+            float h = atan(lab.z, lab.y);
+            float C = length(lab.yz);
+            float3 acc = float3(0.0);
+            // 6 equispaced bands; user labels mapped to nearest OKLab hue
+            // (matches the HueBandExtractor's band-to-anchor mapping).
+            acc += applyAnchor(h, 0.5235987756, uHsl_orange); //  30° (red-orange)
+            acc += applyAnchor(h, 1.5707963268, uHsl_yellow); //  90° (yellow)
+            acc += applyAnchor(h, 2.6179938780, uHsl_green);  // 150° (green)
+            acc += applyAnchor(h, 3.6651914292, uHsl_aqua);   // 210° (cyan/aqua)
+            acc += applyAnchor(h, 4.7123889804, uHsl_blue);   // 270° (blue)
+            acc += applyAnchor(h, 5.7595865316, uHsl_red);    // 330° (magenta/red)
+            // Apply: hue rotation, log-saturation scale (multiplicative), L offset
+            // Gate by chroma so achromatic pixels don't rotate.
+            float chromaGate = clamp(C / 0.02, 0.0, 1.0);
+            float dh  = acc.x * chromaGate;
+            float ds  = acc.y * chromaGate;          // log-domain
+            float dl  = acc.z * chromaGate;
+            float hNew = h + dh;
+            float CNew = C * exp(ds);
+            lab.x += dl;
+            lab.y = CNew * cos(hNew);
+            lab.z = CNew * sin(hNew);
+
+            //   5e. OKLab → linear sRGB → sRGB-encoded
+            float3 linOut = oklabToLinear(lab);
+            rgb = linearToSrgb(clamp(linOut, 0.0, 1.0));
+
+            // 6. Saturation + vibrance
             if (uSaturation != 1.0 || uVibrance != 0.0) {
                 float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
                 if (uSaturation != 1.0) {
